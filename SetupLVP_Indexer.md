@@ -20,3 +20,5 @@ git clone https://github.com/iambullydeluxe-mynameisye/starkill.git && cd starki
 python3 lvp-index.py /web/YZY/lib --output /web/YZY
 ```
 **Then to use in-app enter URL to index.md, example: `https://yzyworks.com/YZY/index.md`**
+
+**App uses HTTP to stream songs, meaning without any dependencies on-server**
