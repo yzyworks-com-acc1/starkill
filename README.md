@@ -24,5 +24,5 @@
 #### All releases support any Android architecture _(like v8, v7a, x86_64 and other)_
 
 # Other
-- [**How to setup self-hosted remote library** _(LVP Type)_](SetupLVP_Indexer.md)
+- [**Self-Hosting Full Guide/Instructions**](SetupSelfHostedSolution.md)
 - [**Build-in libraries**](BuildIn_Libraries.md)
