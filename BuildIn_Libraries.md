@@ -4,18 +4,16 @@
 ## Currently "Whole YZYWORKS" library provides following artists:
 - **Ye**: Released & Unreleased
 - **OsamaSon**: Released
-- **2slimey**: Released
-- **Ty Dolla $ign**: Released
 - **bleood**: Released
 - **Tyler, The Creator**: Released
 - **Don Toliver**: Released
 - **Che**: Released
+- - **Quadeca**: Released
 
 ## Will be soon:
-- **2slimey**: Released
-- **Quadeca**: Released
+
+- **Ty Dolla $ign**: Released
 - **Freddie Gibbs**: Released
 - **Playboi Carti**: Released
-- **JPEGMAFIA**: Released
-- **André 3000**
-- **The Weeknd**
+
+### Suggest artist update/add by [email](mailto:yeezy@yzyworks.com) or [TikTok](https://yzyworks.com/tiktok)
