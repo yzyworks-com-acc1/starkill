@@ -26,3 +26,4 @@
 # Other
 - [**Self-Hosting Full Guide/Instructions**](SetupSelfHostedSolution.md)
 - [**Build-in libraries**](BuildIn_Libraries.md)
+- [**LVP Tags Documentation** _(related to Self-Hosting solution, recommended to use with)_](LVP_TagsDocumentation.md)
