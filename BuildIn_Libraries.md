@@ -9,10 +9,10 @@
 - **Don Toliver**: Released
 - **Che**: Released
 - - **Quadeca**: Released
+- **Ty Dolla $ign**: Released
 
 ## Will be soon:
 
-- **Ty Dolla $ign**: Released
 - **Freddie Gibbs**: Released
 - **Playboi Carti**: Released
 
