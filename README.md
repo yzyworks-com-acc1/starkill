@@ -13,8 +13,10 @@
 
 # Features
 - **Build-in library** _(see [build-in libraries](BuildIn_Libraries.md) artists list that are available to stream for free)_
+- **Build-in ViPER FX audio processing engine** _(full capabilities of original project, without root)_
+- **Music Algorithm** _(artist's Station, "Discover" station; "Autoplay" feature gives capability of recommendations on-device with algorithms by unique properties like related artists, overall playtime and other)_
 - **Lyrics 1:1 Apple Music** _(smooth experience, supports letter-by-letter lyrics)_
-- **Hi-Res Lossless playback**
+- **True Hi-Res Lossless playback** _(special function where audio bypasses AudioFlinger's resamping for USB DACs; for Bluetooth and others - still Lossless but with AudioFlinger's resamping)_
 - **Tag system** _(only trough remote library if supported so)_
 - **Playful animated M3E interface** _(Material 3 Expressive)_
 - **Remote library & streaming support** _(self hosted library with minimal setup of HTTP server with SSL)_
