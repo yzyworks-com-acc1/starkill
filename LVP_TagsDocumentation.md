@@ -9,6 +9,7 @@
 | UR | Un-Released audio. Use for leaked/not on streaming services audios |
 | CC | Listenning Party / Concert |
 | SL | Studio Leak. |
+| LD | Leading track _(track is gonna be shown in main tracklist)_ |
 
 ## Tip to how to add/edit tag/s to audio metadata
 - **Use Kid3 for editing metadata**
