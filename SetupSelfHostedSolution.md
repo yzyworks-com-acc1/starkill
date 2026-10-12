@@ -6,7 +6,7 @@
 # Setup LVP library
 ### Requirements
 - **Working HTTP server with SSL** _(basically a HTTP server with required HTTPS support, allowed to be behind Cloudflare Proxy)_
-- **Library itself** _(tracks; metadata is required for best experience)_
+- **Library itself** _(tracks; metadata is required, highly recommended to use metadata standart `YWLVPv4` (refer to [table](ContentMetadataStandarts.md)))_
 
 > ## LVP type library is mainly read trough index.md file, it includes found tracks metadata to preview for user
 
@@ -21,11 +21,7 @@
 > ### `lib/`
 > - **Recommended name for index. Designed to contain the tracks there**
 > - **Required**
-> - **Usage example** _(library is by `lib/`)_
-> ```
-> python3 lvp-index.py lib/
-> ```
-> _And after that command, index.md & covers, lyrics should be extracted and ready to use_
+> - **Read how to use/operate instuctions at [new guide](LVP_IndexGuide.md)**
 
 > ### `LVP_IndexerRules`
 > - **Controls cosmetic features like last library update date, or library name**
