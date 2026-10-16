@@ -55,9 +55,14 @@
 > git clone https://github.com/yzyworks-com-acc1/starkill.git
 > ```
 > - _Move lvp-index.py to web dir_
-> 2. **Run indexer in web dir** _(where web server serves dir)_:
+> 2. **Collect metadata**:
 > ```
-> python3 lvp-index.py {path to library, should in web server dir or have symlink and viewable from internet}
+> python3 lvp-index.py collect {library path}
+> ```
+> - _After this, metadata should be collected && given unique TrackID if not existed_
+> 3. **Index library**:
+> ```
+> python3 lvp-index.py push-index {library path}
 > ```
 
 - **To setup maximum library with all features, add each dir/file from their descriptions, higher.**
