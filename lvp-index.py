@@ -1,877 +1,868 @@
-# # Code has been assisted by GLM 5.3 (75% of code)
+# # temporary index solution, this has been corrected by GLM-5.3 (that's why most code could just not match what i do, so await for final version)
 from __future__ import annotations
-import os, re, sys, io, time, struct, shutil, secrets, argparse, subprocess, threading
-from concurrent.futures import ThreadPoolExecutor
+import os, re, sys, json, time, struct, shutil, secrets, argparse, tempfile, hashlib, base64, ast
 from urllib.parse import quote
-try: import mutagen; from mutagen import File as MutagenFile; HAVE_MUTAGEN = True
-except Exception: MutagenFile = None; HAVE_MUTAGEN = False
-try: from PIL import Image; HAVE_PIL = True
-except Exception: Image = None; HAVE_PIL = False
+
+mutagen = FLAC = MP3 = MP4 = MP4FreeForm = MP4Cover = MP4Atoms = MP4AtomError = ID3 = TXXX = APEv2 = APENoHeaderError = None
+
 class Main:
+    ManifestName = 'Tracks.dict'
+    CatalogName = 'Tracks'
     class Version:
-        ManageVersion = 1
-        Version = 1.0
-        SubVersion = 0
+        ManageVersion = 2
+        Version = 2.0
+        SubVersion = 1
         SubComment = ''
-        BuildType = 'Stable'  # Could be: Unstable, Stable, Alpha
+        BuildType = 'Stable'
         __build_type_show__ = {'Alpha': 'ALPH', 'Stable': 'STBL', 'Unstable': 'BETA'}[BuildType]
         BuildShow = f'{ManageVersion}{__build_type_show__}-{SubVersion}{SubComment}'
 
     class GlobalCache:
-        AudioExts = ('.flac', '.flac.bin', '.mp3')
+        AudioExts = ('.flac.bin', '.flac', '.mp3', '.m4a')
+        UnsupportedExts = ('.mp4', '.opus', '.ogg', '.oga', '.wav', '.aiff', '.aif', '.aac', '.wma', '.ape')
         ImageExts = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
         CoverStems = ('cover', 'folder', 'front', 'artwork', 'album', 'albumart', 'thumb', 'thumbnail')
         BackStems = ('back', 'backcover', 'back cover', 'back-cover', 'back_cover', 'rear', 'reverse', 'behind', 'bside', 'b-side')
-        SkipDirs = {'covers', 'tracks', '.git', '.tmp', 'node_modules'}
-        UnknownAlbum = 'Singles & Unsorted'
-        ThumbMax = 600  # longest-edge px for grid thumbnails
-        Ffmpeg = shutil.which('ffmpeg')
-        Workers = min(32, (os.cpu_count() or 4) * 2)  # tag reads + pillow resize both release the GIL
-        HaveMutagen = HAVE_MUTAGEN
-        HavePil = HAVE_PIL
-        RenameLock = threading.Lock()
-
-        SlugRe = re.compile(r'[^a-z0-9]+')
+        SkipDirs = {'.git', '.tmp', 'node_modules'}
+        ThumbMax = 600
+        Workers = min(32, (os.cpu_count() or 4) * 2)
         TagCharsRe = re.compile(r'[^A-Z0-9_]+')
         KeySepRe = re.compile(r'[^a-z0-9]+')
-        IllegalRe = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-        ArtistSplitRe = re.compile(r'\s*(?:,|&|/|;|\bfeat\.?\b|\bft\.?\b|\bwith\b|\bvs\.?\b|\bx\b)\s*', re.I)
-        Id3FidRe = re.compile(rb'^[A-Z0-9]+$')
-
-        # the category tag field has been spelled every which way depending on the
-        # tagger and container (vorbis keeps the name, id3 wraps it in a TXXX desc,
-        # plural and singular both seen). first key that carries a value wins.
-        LvpTagKeys = ('yzyworks_lvp_tags', 'yzyworks_lvp_tag',
-                      'yzyworks_tags', 'yzyworks_tag',
-                      'lvp_tags', 'lvp_tag')
-        LvpKeySet = frozenset(LvpTagKeys)
-        MultiValueKeys = frozenset(LvpTagKeys)  # repeats mean several tags, not "last wins"
-        # what files actually say -> the five tags the viewer knows. unlisted
-        # spellings pass through so a new tag still renders as a raw pill.
-        TagAliases = {'AIV': 'AI_V', 'AI_VOCALS': 'AI_V', 'AI_VOCAL': 'AI_V',
-                      'LOSSLESS': 'LL',
-                      'UNRELEASED': 'UR', 'NOT_RELEASED': 'UR', 'NR': 'UR',
-                      'LEAK': 'UR', 'LEAKED': 'UR',
-                      'STUDIO': 'SL', 'STUDIO_LEAK': 'SL',
-                      'CONCERT': 'CC', 'LISTENING_PARTY': 'CC', 'LP': 'CC'}
-        KnownTags = frozenset(TagAliases) | {'AI_V', 'LL', 'UR', 'SL', 'CC'}
-        CommentKeys = ('comment', 'description')  # where the tags lived before the field existed
-        LabelKeys = ('organization', 'label', 'publisher', 'copyright')  # copyright last, it's often "2020 Def Jam"
-        PicFront, PicBack = 3, 4  # shared flac PICTURE / id3 APIC enumeration
-        Id3Encodings = {0: 'latin-1', 1: 'utf-16', 2: 'utf-16-be', 3: 'utf-8'}
-        Id3v22Ids = {b'TT2': b'TIT2', b'TAL': b'TALB', b'TYE': b'TDRC', b'TRK': b'TRCK',
-                     b'TP1': b'TPE1', b'TP2': b'TPE2', b'TPB': b'TPUB', b'TCR': b'TCOP',
-                     b'TXX': b'TXXX', b'COM': b'COMM', b'PIC': b'APIC', b'ULT': b'USLT',
-                     b'SLT': b'SYLT'}
+        LvpTagKeys = ('lvp_yzyworks_tags', 'yzyworks_lvp_tags', 'yzyworks_lvp_tag', 'yzyworks_tags', 'yzyworks_tag', 'lvp_tags', 'lvp_tag')
+        IdKeys = ('lvp_yzyworks_trackid', 'yzyworks_lvp_trackid', 'yzyworks_trackid', 'lvp_trackid')
+        TagAliases = {'AIV': 'AI_V', 'AI_VOCALS': 'AI_V', 'AI_VOCAL': 'AI_V', 'LOSSLESS': 'LL',
+                      'UNRELEASED': 'UR', 'NOT_RELEASED': 'UR', 'NR': 'UR', 'LEAK': 'UR', 'LEAKED': 'UR',
+                      'STUDIO': 'SL', 'STUDIO_LEAK': 'SL', 'CONCERT': 'CC', 'LISTENING_PARTY': 'CC', 'LP': 'CC', 'LEADING': 'LD', 'LEADING_TRACK': 'LD'}
+        KnownTags = frozenset(TagAliases) | {'AI_V', 'LL', 'UR', 'SL', 'CC', 'LD'}
+        LabelKeys = ('organization', 'label', 'publisher', 'copyright')
+        Id3Map = {'TIT2': 'title', 'TALB': 'album', 'TPE1': 'artist', 'TPE2': 'albumartist', 'TDRC': 'date',
+                  'TYER': 'date', 'TDOR': 'originaldate', 'TDRL': 'release_time', 'TRCK': 'tracknumber', 'TPOS': 'discnumber',
+                  'TCON': 'genre', 'TCOM': 'composer', 'TPE3': 'performer', 'TCOP': 'copyright', 'TPUB': 'publisher',
+                  'TSRC': 'isrc', 'TSOT': 'sort_name', 'TSOA': 'sort_album', 'TSOP': 'sort_artist',
+                  'TSO2': 'sort_album_artist', 'TSOC': 'sort_composer', 'TENC': 'encoder', 'TBPM': 'bpm'}
+        DigestRe = re.compile(r'[0-9a-f]{64}\Z')
+        TrackRe = re.compile(r'[0-9a-f]{128}\Z')
+        Ffmpeg = shutil.which('ffmpeg')
 
     class Activities:
-        # ---------------------------------------------------------------- tags
         @classmethod
-        def LvpKey(cls, name):
-            # canonical name for an lvp field key, or None. folds separators so
-            # "YZYWORKS LVP TAGS" / "YZYWORKS-LVP-TAGS" hit the same field
-            k = gc.KeySepRe.sub('_', (name or '').strip().lower()).strip('_')
-            return k if k in gc.LvpKeySet else None
-
-        @classmethod
-        def ParseTagList(cls, raw):
-            # separators: comma, period, semicolon, slash, pipe, newline/tab. a
-            # plain space is NOT one, so "studio leak" stays a single tag
-            out = []
-            for part in re.split(r'[,.;/|\r\n\t]+', raw or ''):
-                for tok in cls._SplitSpaced(part):
-                    tok = gc.TagAliases.get(tok, tok)
-                    if tok not in out: out.append(tok)
-            return out
-
-        @classmethod
-        def _SplitSpaced(cls, part):
-            # "LL UR AI_V" is three tags, "studio leak" is one: split only when the
-            # whole folded chunk is unknown AND every word in it is known
-            whole = gc.TagCharsRe.sub('_', part.strip().upper()).strip('_')
-            if not whole: return []
-            if whole in gc.KnownTags: return [whole]
-            words = [w for w in (gc.TagCharsRe.sub('_', x.upper()).strip('_') for x in part.split()) if w]
-            if len(words) > 1 and all(w in gc.KnownTags for w in words): return words
-            return [whole]
-
-        @classmethod
-        def LvpTagsOf(cls, tags):
-            for k in gc.LvpTagKeys:
-                raw = (tags.get(k) or '').strip()
-                if raw: return cls.ParseTagList(raw)
-            # comment fallback. "studio leak" wins over "unreleased" since a leak
-            # description very often says both
-            comment = ' '.join((tags.get(k) or '') for k in gc.CommentKeys).lower()
-            if 'studio leak' in comment: return ['SL']
-            if 'unreleased' in comment: return ['UR']
-            return []
-
-        @classmethod
-        def Slugify(cls, s): return gc.SlugRe.sub('-', s.lower()).strip('-') or 'album'
-
-        @classmethod
-        def IsAudio(cls, name):
-            n = name.lower(); return any(n.endswith(e) for e in gc.AudioExts)
-
-        @classmethod
-        def ReadIndexerRules(cls, out_dir):
-            # header tag lines from LVP_IndexerRules, copied verbatim above the
-            # first '---' of index.md. the viewer skips everything up there
+        def EnsureMutagen(cls):
+            global mutagen, FLAC, MP3, MP4, MP4FreeForm, MP4Cover, MP4Atoms, MP4AtomError, ID3, TXXX, APEv2, APENoHeaderError
+            if FLAC is not None: return
             try:
-                with open(os.path.join(out_dir, 'LVP_IndexerRules'), encoding='utf-8') as f:
-                    return [l.strip() for l in f if l.strip()]
-            except OSError: return []
+                import mutagen
+                from mutagen.flac import FLAC
+                from mutagen.mp3 import MP3
+                from mutagen.mp4 import MP4, MP4FreeForm, MP4Cover
+                from mutagen.mp4._atom import Atoms as MP4Atoms, AtomError as MP4AtomError
+                from mutagen.id3 import ID3, TXXX
+                from mutagen.apev2 import APEv2, APENoHeaderError
+            except ImportError as e:
+                raise cls.Error('Collection needs mutagen. Install it with: python3 -m pip install mutagen') from e
+
+        class Error(Exception): pass
 
         @classmethod
-        def ReadExistingLyrics(cls, index_path):
-            # album -> lyrics bool from a previous index.md, so the flag survives a reindex
-            out, name = {}, None
+        def Canonical(cls, value): return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
+
+        @classmethod
+        def Digest(cls, value): return hashlib.sha256(cls.Canonical(value)).hexdigest()
+
+        @classmethod
+        def SyncDir(cls, path):
+            fd = os.open(path, os.O_RDONLY)
+            try: os.fsync(fd)
+            finally: os.close(fd)
+
+        @classmethod
+        def AtomicWrite(cls, path, data, private=False, before_commit=None):
+            if os.path.islink(path): raise cls.Error('Refusing symlink target: %s' % path)
+            if os.path.exists(path) and not os.path.isfile(path): raise cls.Error('Refusing non-file target: %s' % path)
+            if os.path.isfile(path):
+                with open(path, 'rb') as f:
+                    if f.read() == data:
+                        if before_commit: before_commit()
+                        return False
+            parent = os.path.dirname(path); os.makedirs(parent, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix='.lvp-write-', dir=parent)
             try:
-                with open(index_path, encoding='utf-8') as f:
-                    for raw in f:
-                        line = raw.strip()
-                        if line.startswith('> ') and not line.startswith('> !['): name = line[2:].strip()
-                        elif name and line.lower().startswith('lyrics:'):
-                            out[name] = line.split(':', 1)[1].strip().lower() in ('yes', 'true', '1', 'on')
-            except OSError: pass
-            return out
-
-        # ---------------------------------------------------------------- flac
-        @classmethod
-        def _FlacStart(cls, data):
-            # taggers sometimes prepend an ID3v2 tag to a flac, the marker isn't at 0
-            if data[:4] == b'fLaC': return 0
-            if data[:3] == b'ID3' and len(data) >= 10:
-                size = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) | \
-                       ((data[8] & 0x7F) << 7) | (data[9] & 0x7F)
-                off = 10 + size
-                if data[off:off + 4] == b'fLaC': return off
-            off = data.find(b'fLaC', 0, 65536)
-            return off if off >= 0 else -1
+                os.fchmod(fd, 0o600 if private else 0o644)
+                with os.fdopen(fd, 'wb') as f: f.write(data); f.flush(); os.fsync(f.fileno())
+                if before_commit: before_commit()
+                os.replace(tmp, path); cls.SyncDir(parent); return True
+            finally:
+                if os.path.exists(tmp): os.unlink(tmp)
 
         @classmethod
-        def _FlacBlocks(cls, data):
-            off = cls._FlacStart(data)
-            if off < 0: return
-            off += 4
-            while off + 4 <= len(data):
-                header = data[off]; last = header & 0x80; btype = header & 0x7F
-                length = int.from_bytes(data[off + 1:off + 4], 'big')
-                yield btype, data[off + 4:off + 4 + length]
-                off += 4 + length
-                if last: break
+        def ParseProperties(cls, path):
+            try:
+                with open(path, encoding='utf-8') as f: lines = f.read().splitlines()
+            except (OSError, UnicodeError) as e: raise cls.Error('%s: %s' % (path, e)) from e
+            values, raw, i = {}, {}, 0
+            while i < len(lines):
+                line = lines[i]; number = i + 1; i += 1
+                if not line.strip() or line.lstrip().startswith('#'): continue
+                if ':' not in line: raise cls.Error('%s:%d: expected key: value' % (path, number))
+                key, value = line.split(':', 1); key = key.strip(); value = value.lstrip(' \t')
+                if not key or key in values: raise cls.Error('%s:%d: empty or duplicate key %r' % (path, number, key))
+                original = value
+                if value.startswith('```'):
+                    content = value[3:]; parts = []
+                    while '```' not in content:
+                        parts.append(content)
+                        if i >= len(lines): raise cls.Error('%s:%d: unclosed description fence' % (path, number))
+                        content = lines[i]; original += '\n' + content; i += 1
+                    before, after = content.split('```', 1)
+                    if after.strip(): raise cls.Error('%s:%d: unexpected text after closing fence' % (path, i))
+                    parts.append(before); value = '\n'.join(parts)
+                    if value.startswith('\n'): value = value[1:]
+                    if value.endswith('\n'): value = value[:-1]
+                elif '```' in value: raise cls.Error('%s:%d: fence must start the value' % (path, number))
+                values[key] = value.replace('\\n', '\n') if key == 'description' else value; raw[key] = original
+            return {'values': values, 'raw': raw}
 
         @classmethod
-        def _ParseVorbisComment(cls, payload):
-            tags = {}
-            p = 0
-            vlen = struct.unpack('<I', payload[p:p + 4])[0]; p += 4 + vlen
-            count = struct.unpack('<I', payload[p:p + 4])[0]; p += 4
-            for _ in range(count):
-                if p + 4 > len(payload): break
-                clen = struct.unpack('<I', payload[p:p + 4])[0]; p += 4
-                entry = payload[p:p + clen].decode('utf-8', 'replace'); p += clen
-                if '=' in entry:
-                    k, v = entry.split('=', 1)
-                    k = cls.LvpKey(k.strip().lower()) or k.strip().lower()
-                    if k in gc.MultiValueKeys and tags.get(k): tags[k] = tags[k] + ', ' + v
-                    else: tags[k] = v
-            return tags
+        def ReadRules(cls, root):
+            path = os.path.join(root, 'LVP_IndexerRules')
+            return cls.ParseProperties(path)['values'] if os.path.isfile(path) else {}
 
         @classmethod
-        def _ParseFlacPicture(cls, payload):
-            p = 0
-            ptype = struct.unpack('>I', payload[p:p + 4])[0]; p += 4
-            mlen = struct.unpack('>I', payload[p:p + 4])[0]; p += 4
-            mime = payload[p:p + mlen].decode('ascii', 'replace'); p += mlen
-            dlen = struct.unpack('>I', payload[p:p + 4])[0]; p += 4
-            p += dlen + 16  # description + width/height/depth/colors
-            ilen = struct.unpack('>I', payload[p:p + 4])[0]; p += 4
-            return ptype, mime, payload[p:p + ilen]
+        def LibraryProperties(cls, rules):
+            props = dict(rules)
+            if props.get('description'): props['description'] = props['description'][:350]
+            return props
+
+        class Progress:
+            def __init__(self, total, label): self.total = total; self.done = 0; self.label = label; self.start = time.monotonic()
+            def step(self):
+                self.done += 1
+                if sys.stderr.isatty():
+                    elapsed = max(time.monotonic() - self.start, .001); rate = self.done / elapsed
+                    sys.stderr.write('\r%s %d/%d (%.1f/s)' % (self.label, self.done, self.total, rate)); sys.stderr.flush()
+            def close(self):
+                if sys.stderr.isatty(): sys.stderr.write('\r\033[K'); sys.stderr.flush()
 
         class ArtPicker:
-            # front: first picture, or a declared type-3 over an untyped one.
-            # back: ONLY a declared type-4 - guessing "second picture = reverse"
-            # puts leaflet scans and disc labels on the back of the sleeve
-            def __init__(self): self.front = None; self.back = None; self._front_typed = False
-            def add(self, ptype, mime, img):
-                if not img: return
-                try: ptype = int(ptype)
-                except (TypeError, ValueError): ptype = 0
-                if ptype == gc.PicBack:
-                    if self.back is None: self.back = (mime, img)
-                elif self.front is None or (ptype == gc.PicFront and not self._front_typed):
-                    self.front = (mime, img); self._front_typed = ptype == gc.PicFront
+            def __init__(self): self.front = None; self.back = None; self.typed = False
+            def add(self, ptype, mime, data):
+                if not data: return
+                if ptype == 4:
+                    if self.back is None: self.back = (mime, data)
+                elif ptype in (0, 3) and (self.front is None or (ptype == 3 and not self.typed)):
+                    self.front = (mime, data); self.typed = ptype == 3
             def result(self): return self.front, self.back
 
         @classmethod
-        def ReadFlac(cls, path):
-            with open(path, 'rb') as f: data = f.read()
-            tags, duration = {}, 0.0
-            art = cls.ArtPicker()
-            for btype, payload in cls._FlacBlocks(data):
-                if btype == 0 and len(payload) >= 18:  # STREAMINFO
-                    val = int.from_bytes(payload[10:18], 'big')
-                    sample_rate = (val >> 44) & 0xFFFFF; total_samples = val & 0xFFFFFFFFF
-                    if sample_rate: duration = total_samples / sample_rate
-                elif btype == 4: tags = cls._ParseVorbisComment(payload)
-                elif btype == 6:
-                    try: art.add(*cls._ParseFlacPicture(payload))  # every picture, not just the first
-                    except (struct.error, IndexError): pass
-            if duration: tags.setdefault('duration', duration)
-            front, back = art.result()
-            return tags, front, back
-
-        # ---------------------------------------------------------------- mp3 / id3v2
-        @classmethod
-        def _Id3Text(cls, enc, raw): return raw.decode(gc.Id3Encodings.get(enc, 'utf-8'), 'replace')
+        def HashRange(cls, path, start, end):
+            h = hashlib.sha256()
+            with open(path, 'rb') as f:
+                f.seek(start); left = end - start
+                while left:
+                    data = f.read(min(left, 1024 * 1024))
+                    if not data: raise cls.Error('%s: truncated audio payload' % path)
+                    h.update(data); left -= len(data)
+            return h.hexdigest()
 
         @classmethod
-        def _Id3SplitTerminated(cls, enc, raw):
-            # utf-16 terminates on a 2-byte null on an even boundary
-            if enc in (1, 2):
-                i = 0
-                while i + 1 < len(raw):
-                    if raw[i] == 0 and raw[i + 1] == 0:
-                        return cls._Id3Text(enc, raw[:i]), raw[i + 2:]
-                    i += 2
-                return cls._Id3Text(enc, raw), b''
-            i = raw.find(b'\x00')
-            if i < 0: return cls._Id3Text(enc, raw), b''
-            return cls._Id3Text(enc, raw[:i]), raw[i + 1:]
-
-        @classmethod
-        def _Id3Multi(cls, enc, raw):
-            junk = '﻿ \t\r\n'  # split leaves the BOM on each utf-16 value
-            return [s.strip(junk) for s in cls._Id3Text(enc, raw).split('\x00') if s.strip(junk)]
-
-        @classmethod
-        def _ParseSylt(cls, body):
-            # sylt -> plain [mm:ss.xx] lrc lines. only format 1 (ms) is trustworthy
-            if len(body) < 6: return ''
-            enc = body[0]; fmt = body[4]; rest = body[6:]
-            lines = []
-            while rest:
-                text, rest = cls._Id3SplitTerminated(enc, rest)
-                if len(rest) < 4: break
-                stamp = int.from_bytes(rest[:4], 'big'); rest = rest[4:]
-                if fmt != 1: continue
-                total = stamp / 1000.0
-                text = text.replace('\n', ' ').replace('\r', ' ').strip()
-                if text: lines.append('[%02d:%05.2f]%s' % (int(total // 60), total % 60, text))
-            return '\n'.join(lines)
-
-        @classmethod
-        def _Id3Deunsync(cls, raw):
-            # every 0xFF 0x00 pair is a literal 0xFF
-            out = bytearray(); i, n = 0, len(raw)
-            while i < n:
-                out.append(raw[i])
-                if raw[i] == 0xFF and i + 1 < n and raw[i + 1] == 0x00: i += 2
-                else: i += 1
-            return bytes(out)
-
-        @classmethod
-        def _Id3ExtHeaderLen(cls, version, body):
-            # v2.3 size excludes itself, v2.4 synchsafe size includes itself
-            if len(body) < 4: return 0
-            if version >= 4:
-                size = ((body[0] & 0x7F) << 21) | ((body[1] & 0x7F) << 14) | \
-                       ((body[2] & 0x7F) << 7) | (body[3] & 0x7F)
-                return size if 6 <= size <= len(body) else 0
-            size = int.from_bytes(body[:4], 'big')
-            return 4 + size if 0 < size <= len(body) - 4 else 0
-
-        @classmethod
-        def _Id3Frames(cls, data):
-            if data[:3] != b'ID3' or len(data) < 10: return
-            version, flags = data[3], data[5]
-            size = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) | \
-                   ((data[8] & 0x7F) << 7) | (data[9] & 0x7F)
-            body = data[10:10 + size]
-            if flags & 0x80 and version < 4: body = cls._Id3Deunsync(body)  # whole-tag unsync on v2.2/2.3
-            if flags & 0x40: body = body[cls._Id3ExtHeaderLen(version, body):]
-            idlen, szlen, flaglen = (3, 3, 0) if version == 2 else (4, 4, 2)
-            hdr = idlen + szlen + flaglen
-            p, end = 0, len(body)
-            while p + hdr <= end:
-                fid = body[p:p + idlen]
-                if fid[:1] == b'\x00':
-                    # a rewrite in place can leave a zero gap IN FRONT of frames,
-                    # so skip the run and carry on if real frames follow
-                    while p < end and body[p] == 0: p += 1
-                    if p + hdr > end or not gc.Id3FidRe.match(body[p:p + idlen]): break
-                    continue
-                if not gc.Id3FidRe.match(fid): break  # walk lost its place
-                raw_size = body[p + idlen:p + idlen + szlen]
-                if version >= 4:
-                    fsize = ((raw_size[0] & 0x7F) << 21) | ((raw_size[1] & 0x7F) << 14) | \
-                            ((raw_size[2] & 0x7F) << 7) | (raw_size[3] & 0x7F)
-                    # plenty of taggers write plain big-endian sizes in a v2.4 tag;
-                    # trust whichever reading lands on a next frame header
-                    plain = int.from_bytes(raw_size, 'big')
-                    if plain != fsize and 0 < plain <= end - p - hdr:
-                        nxt = body[p + hdr + fsize:p + hdr + fsize + idlen]
-                        if not gc.Id3FidRe.match(nxt) and nxt[:1] != b'\x00': fsize = plain
-                else:
-                    fsize = int.from_bytes(raw_size, 'big')
-                if fsize <= 0 or p + hdr + fsize > end: break
-                fflags = body[p + idlen + szlen:p + hdr] if flaglen else b'\x00\x00'
-                fbody = body[p + hdr:p + hdr + fsize]
-                p += hdr + fsize
-                if version >= 4:
-                    if fflags[1] & 0x0C: continue  # compressed / encrypted
-                    if fflags[1] & 0x40: fbody = fbody[1:]  # group byte
-                    if fflags[1] & 0x01: fbody = fbody[4:]  # data length indicator
-                    if fflags[1] & 0x02: fbody = cls._Id3Deunsync(fbody)
-                elif version == 3:
-                    if fflags[1] & 0xC0: continue
-                    if fflags[1] & 0x20: fbody = fbody[1:]
-                if fbody: yield gc.Id3v22Ids.get(fid, fid), fbody
-
-        @classmethod
-        def ReadMp3(cls, path):
-            with open(path, 'rb') as f: data = f.read()
-            if data[:3] != b'ID3': return {}, None, None
-            tags = {}; art = cls.ArtPicker()
-            for fid, body in cls._Id3Frames(data):
-                if fid == b'APIC':
-                    # enc, mime\0, pic type, desc\0, image
-                    try:
-                        enc = body[0]
-                        i = body.index(b'\x00', 1)
-                        mime = body[1:i].decode('ascii', 'replace')
-                        _desc, img = cls._Id3SplitTerminated(enc, body[i + 2:])
-                        art.add(body[i + 1], mime, img)
-                    except (ValueError, IndexError): pass
-                elif fid == b'USLT' and not tags.get('unsyncedlyrics') and len(body) > 4:
-                    _desc, rest = cls._Id3SplitTerminated(body[0], body[4:])
-                    text = cls._Id3Text(body[0], rest).strip()
-                    if text: tags['unsyncedlyrics'] = text
-                elif fid == b'SYLT' and not tags.get('syncedlyrics'):
-                    text = cls._ParseSylt(body)
-                    if text: tags['syncedlyrics'] = text
-                elif fid == b'TXXX' and len(body) > 1:
-                    # the description IS the field name - this is how the category
-                    # tag field reaches an mp3 at all
-                    desc, rest = cls._Id3SplitTerminated(body[0], body[1:])
-                    key = cls.LvpKey(desc.strip().lower()) or desc.strip().lower()
-                    val = ', '.join(cls._Id3Multi(body[0], rest))
-                    if key and val:
-                        if key in gc.MultiValueKeys and tags.get(key): tags[key] = tags[key] + ', ' + val
-                        else: tags[key] = val
-                elif fid.startswith(b'T'):
-                    text = cls._Id3SplitTerminated(body[0], body[1:])[0].strip()
-                    key = {b'TIT2': 'title', b'TALB': 'album', b'TDRC': 'date',
-                           b'TYER': 'date', b'TRCK': 'tracknumber',
-                           b'TPE1': 'artist', b'TPE2': 'albumartist',
-                           b'TPUB': 'organization', b'TCOP': 'copyright'}.get(fid)
-                    if key: tags[key] = text
-                elif fid == b'COMM' and len(body) > 4:
-                    # the text is not null-terminated but plenty of taggers write a
-                    # trailing NUL anyway, and strip() doesn't remove it
-                    _desc, rest = cls._Id3SplitTerminated(body[0], body[4:])
-                    tags['comment'] = cls._Id3Text(body[0], rest).strip('\x00 \t\r\n')
-            front, back = art.result()
-            return tags, front, back
-
-        # ---------------------------------------------------------------- mutagen fallback
-        @classmethod
-        def _MutagenOne(cls, v):
-            # mp4 freeform atoms hand back a bytes subclass; str() would repr it
-            if isinstance(v, (bytes, bytearray)): return bytes(v).decode('utf-8', 'replace')
-            return str(v)
-
-        @classmethod
-        def _MutagenText(cls, val):
-            # flatten whatever mutagen returns into one comma-joined string, a list
-            # of values means several tags
-            if isinstance(val, (bytes, bytearray)): return cls._MutagenOne(val)
-            if isinstance(val, (list, tuple)):
-                return ', '.join(cls._MutagenOne(v) for v in val if cls._MutagenOne(v).strip())
-            text = getattr(val, 'text', None)
-            if isinstance(text, (list, tuple)):
-                return ', '.join(cls._MutagenOne(v) for v in text if cls._MutagenOne(v).strip())
-            return cls._MutagenOne(text if text is not None else val)
-
-        @classmethod
-        def ReadMutagen(cls, path):
-            try: mf = MutagenFile(path)
-            except Exception: return {}, None, None
-            if mf is None: return {}, None, None
-            tags = {}
-            for k in ('title', 'album', 'date', 'tracknumber', 'comment', 'description',
-                      'artist', 'albumartist', 'organization', 'label', 'publisher',
-                      'copyright', 'lyrics', 'syncedlyrics', 'unsyncedlyrics', 'unsyncedlyric'):
-                val = mf.tags.get(k) if mf.tags else None
-                if val: tags[k] = str(val[0] if isinstance(val, list) else val)
-            # the tag field arrives under a different key per container (vorbis name,
-            # 'TXXX:...' on id3, '----:com.apple.iTunes:...' on mp4). match on the
-            # last colon-separated segment so all three land
-            try: items = list(mf.tags.items()) if mf.tags else []
-            except Exception: items = []
-            for key, val in items:
-                k = cls.LvpKey(str(key).strip().lower().rsplit(':', 1)[-1])
-                if not k: continue
-                text = cls._MutagenText(val).strip()
-                if text: tags[k] = (tags[k] + ', ' + text) if tags.get(k) else text
-            art = cls.ArtPicker()
-            pics = getattr(mf, 'pictures', None)
-            if pics:
-                for pic in pics: art.add(getattr(pic, 'type', 0), getattr(pic, 'mime', ''), getattr(pic, 'data', b''))
-            elif mf.tags:
-                # id3 keys APIC frames as 'APIC:<desc>', so a bare 'APIC:' lookup only
-                # ever matched art with an empty description
-                try: frames = list(mf.tags.items())
-                except Exception: frames = []
-                for key, frame in frames:
-                    if not str(key).startswith('APIC'): continue
-                    art.add(getattr(frame, 'type', 0), getattr(frame, 'mime', ''), getattr(frame, 'data', b''))
-            front, back = art.result()
-            return tags, front, back
-
-        @classmethod
-        def ReadApev2(cls, path):
-            # apev2 is a second, independent tag block next to id3, and mutagen's
-            # File() only picks one per file - on an mp3 that's always id3
-            if not gc.HaveMutagen: return {}
-            try: from mutagen.apev2 import APEv2
-            except ImportError: return {}
-            try: ape = APEv2(path)
-            except Exception: return {}
-            out = {}
-            try: items = list(ape.items())
-            except Exception: return {}
-            for key, val in items:
-                k = cls.LvpKey(key)
-                if not k: continue
-                text = cls._MutagenText(val).strip()
-                if text: out[k] = (out[k] + ', ' + text) if out.get(k) else text
-            return out
-
-        @classmethod
-        def ReadSong(cls, path):
-            name = os.path.basename(path).lower()
-            if name.endswith('.flac') or name.endswith('.flac.bin'): tags, pic, back = cls.ReadFlac(path)
-            elif name.endswith('.mp3'): tags, pic, back = cls.ReadMp3(path)
-            else: tags, pic, back = {}, None, None
-            # mutagen also for a missing back cover or missing category tags: the
-            # hand-rolled walk can't reach every shape of tag (ext header, unsync,
-            # data-length indicator), and only files that look incomplete get here
-            if (not tags or pic is None or back is None or not cls.LvpTagsOf(tags)) and gc.HaveMutagen:
-                mt, mp, mb = cls.ReadMutagen(path)
-                tags = {**mt, **tags}; pic = pic or mp; back = back or mb
-            if gc.HaveMutagen and not cls.LvpTagsOf(tags):
-                for k, v in cls.ReadApev2(path).items(): tags.setdefault(k, v)
-            return tags, pic, back
-
-        # ---------------------------------------------------------------- helpers
-        @classmethod
-        def SniffImageExt(cls, data, mime):
-            # real extension from magic bytes; a lying extension gets refused by browsers
-            if data[:3] == b'\xff\xd8\xff': return '.jpg'
-            if data[:8] == b'\x89PNG\r\n\x1a\n': return '.png'
-            if data[:4] == b'RIFF' and data[8:12] == b'WEBP': return '.webp'
-            if data[:6] in (b'GIF87a', b'GIF89a'): return '.gif'
-            return {'image/png': '.png', 'image/jpeg': '.jpg', 'image/jpg': '.jpg',
-                    'image/webp': '.webp', 'image/gif': '.gif'}.get((mime or '').lower(), '.jpg')
-
-        @classmethod
-        def MakeThumbnail(cls, src_bytes, out_path, max_edge=None):
-            if max_edge is None: max_edge = gc.ThumbMax
-            if gc.HavePil:
-                try:
-                    im = Image.open(io.BytesIO(src_bytes))
-                    if max(im.size) <= max_edge: return False
-                    im = im.convert('RGB') if im.mode not in ('RGB', 'L') else im
-                    im.thumbnail((max_edge, max_edge), Image.LANCZOS)
-                    im.save(out_path, 'JPEG', quality=82, optimize=True)
-                    return True
-                except Exception: return False
-            if gc.Ffmpeg:
-                try:
-                    vf = ("scale='if(gt(iw,ih),min(%d,iw),-2)':'if(gt(iw,ih),-2,min(%d,ih))'"
-                          % (max_edge, max_edge))
-                    r = subprocess.run([gc.Ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
-                                        '-i', 'pipe:0', '-vf', vf, '-frames:v', '1', out_path],
-                                       input=src_bytes, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    return r.returncode == 0 and os.path.getsize(out_path) > 0
-                except Exception: return False
-            return False
-
-        @classmethod
-        def SplitArtists(cls, value):
-            out = []
-            for part in gc.ArtistSplitRe.split(value or ''):
-                name = ' '.join(part.split())
-                if name: out.append(name)
-            return out
-
-        @classmethod
-        def AlbumAuthor(cls, songs):
-            sources = [s['album_artist'] for s in songs if s.get('album_artist')] or \
-                      [s['artist'] for s in songs if s.get('artist')]
-            seen, names = set(), []
-            for value in sources:
-                for name in cls.SplitArtists(value):
-                    key = name.casefold()
-                    if key in seen: continue
-                    seen.add(key); names.append(name)
-            return ', '.join(names) if names else 'Unknown'
-
-        @classmethod
-        def CleanTitle(cls, tags, filename):
-            if tags.get('title'): return tags['title']
-            base = re.sub(r'\.flac\.bin$', '', filename, flags=re.I)
-            base = re.sub(r'\.[^.]+$', '', base)
-            return re.sub(r'^\s*\d+\s*[-.]?\s*', '', base).strip() or filename
-
-        @classmethod
-        def TrackNo(cls, tags, fallback):
-            tn = str(tags.get('tracknumber', '')).split('/')[0]
-            return int(tn) if tn.isdigit() else fallback
-
-        @classmethod
-        def YearOf(cls, tags):
-            m = re.search(r'\d{4}', str(tags.get('date', '')))
-            return m.group(0) if m else ''
-
-        @classmethod
-        def LabelOf(cls, tags):
-            for k in gc.LabelKeys:
-                v = (tags.get(k) or '').strip()
-                if v: return v
-            return ''
-
-        @classmethod
-        def DurationOf(cls, tags):
-            # can arrive as a float (streaminfo) or a string DURATION tag
-            try: return float(tags.get('duration', 0.0) or 0.0)
-            except (TypeError, ValueError): return 0.0
-
-        # ---------------------------------------------------------------- rename & lrc
-        @classmethod
-        def SanitizeFilenamePart(cls, s):
-            s = gc.IllegalRe.sub('_', s).strip()
-            s = re.sub(r'_+', '_', s)
-            return s.rstrip('. ')
-
-        @classmethod
-        def RandomHex(cls): return secrets.token_hex(8)
+        def HashPayload(cls, path, layout):
+            ranges = layout.get('payload_ranges')
+            if not ranges: return cls.HashRange(path, layout['start'], layout['end'])
+            h = hashlib.sha256()
+            with open(path, 'rb') as f:
+                for start, end in ranges:
+                    f.seek(start); left = end - start
+                    while left:
+                        data = f.read(min(left, 1024 * 1024))
+                        if not data: raise cls.Error('%s: truncated audio payload' % path)
+                        h.update(data); left -= len(data)
+            return h.hexdigest()
 
         @classmethod
         def SplitAudioExt(cls, name):
-            lower = name.lower()
-            if lower.endswith('.flac.bin'): return name[:-9], name[-9:]
-            dot = name.rfind('.')
-            return (name[:dot], name[dot:]) if dot > 0 else (name, '')
+            for ext in gc.AudioExts:
+                if name.lower().endswith(ext): return name[:-len(ext)], name[-len(ext):]
+            return os.path.splitext(name)
 
         @classmethod
-        def ExtractLyrics(cls, tags):
-            for k in ('syncedlyrics', 'lyrics'):
-                v = tags.get(k, '').strip()
-                if v: return v
-            for k in ('unsyncedlyrics', 'unsyncedlyric'):
-                v = tags.get(k, '').strip()
-                if v: return v
-            return ''
+        def WalkAudio(cls, root):
+            def failed(error): raise cls.Error('Source discovery failed: %s' % error)
+            for folder, dirs, files in os.walk(root, followlinks=False, onerror=failed):
+                dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d.lower() not in gc.SkipDirs and not os.path.islink(os.path.join(folder, d)))
+                for name in sorted(files):
+                    if name.startswith('.'): continue
+                    path = os.path.join(folder, name)
+                    if name.lower().endswith(gc.UnsupportedExts): raise cls.Error('%s: unsupported audio format; supported: FLAC, .flac.bin, MP3, M4A' % path)
+                    if name.lower().endswith(gc.AudioExts):
+                        if os.path.islink(path): raise cls.Error('%s: audio symlinks are not prepared; copy the source into the library' % path)
+                        yield path
 
         @classmethod
-        def LrcPathFor(cls, audio_path):
-            # x.flac.bin -> x.flac.lrc, same as the player derives it
-            stem, _ext = cls.SplitAudioExt(os.path.basename(audio_path))
-            return os.path.join(os.path.dirname(audio_path), stem + '.lrc')
+        def AlbumRoot(cls, path, root):
+            folder = os.path.dirname(path); current = folder
+            while True:
+                if os.path.isfile(os.path.join(current, 'AlbumProperties')): return current
+                if current == root: return folder
+                current = os.path.dirname(current)
 
         @classmethod
-        def WriteLrcFile(cls, audio_path, tags):
-            text = cls.ExtractLyrics(tags)
-            if not text: return False
-            try:
-                with open(cls.LrcPathFor(audio_path), 'w', encoding='utf-8') as f:
-                    f.write(text.replace('\r\n', '\n').replace('\r', '\n') + '\n')
-                return True
-            except OSError: return False
+        def ParseTagList(cls, raw):
+            out = []
+            for part in re.split(r'[,.;/|\r\n\t]+', raw or ''):
+                whole = gc.TagCharsRe.sub('_', part.strip().upper()).strip('_')
+                if not whole: continue
+                words = [gc.TagCharsRe.sub('_', w.upper()).strip('_') for w in part.split()]
+                tokens = words if whole not in gc.KnownTags and len(words) > 1 and all(w in gc.KnownTags for w in words) else [whole]
+                for token in tokens:
+                    token = gc.TagAliases.get(token, token)
+                    if token not in out: out.append(token)
+            return out
 
         @classmethod
-        def ComputeRenameTarget(cls, old_path, tags):
-            dname = os.path.dirname(old_path)
-            stem, ext = cls.SplitAudioExt(os.path.basename(old_path))
-            old_title, old_artist = None, None
-            if ' - ' in stem: old_title, old_artist = [p.strip() for p in stem.split(' - ', 1)]
-            else: old_title = stem.strip()
-
-            def is_hex(s): return bool(s) and len(s) == 16 and all(c in '0123456789abcdef' for c in s.lower())
-
-            title = (tags.get('title') or '').strip() or (old_title if is_hex(old_title) else cls.RandomHex())
-            artist = (tags.get('artist') or tags.get('albumartist') or '').strip() or \
-                     (old_artist if is_hex(old_artist) else cls.RandomHex())
-            title = cls.SanitizeFilenamePart(title) or cls.RandomHex()
-            artist = cls.SanitizeFilenamePart(artist) or cls.RandomHex()
-            new_path = os.path.join(dname, '%s - %s%s' % (title, artist, ext))
-
-            if (os.path.samefile(old_path, new_path) if os.path.exists(new_path) else old_path == new_path):
-                return None
-            if os.path.exists(new_path):
-                for _ in range(100):
-                    new_path = os.path.join(dname, '%s - %s %s%s' % (title, artist, cls.RandomHex()[:8], ext))
-                    if not os.path.exists(new_path): break
-                else:
-                    return None  # 100 collisions, give up
-            return new_path
+        def Key(cls, key): return gc.KeySepRe.sub('_', key.lower()).strip('_')
 
         @classmethod
-        def RenameAudioWithLrc(cls, old_path, new_path):
-            with gc.RenameLock:  # two threads can both see "target free"
-                if os.path.exists(new_path): return False
-                os.rename(old_path, new_path)
-                old_lrc, new_lrc = cls.LrcPathFor(old_path), cls.LrcPathFor(new_path)
-                if os.path.isfile(old_lrc):
-                    try: os.rename(old_lrc, new_lrc)
-                    except OSError: pass
-                return True
+        def TagValues(cls, raw, key):
+            out = []
+            for k, values in raw.items():
+                normalized = cls.Key(k)
+                if normalized == key or k.startswith('----:') and cls.Key(k.rsplit(':', 1)[-1]) == key: out.extend(values)
+            return out
 
         @classmethod
-        def RelUrl(cls, src_abs, out_dir):
-            # clean relative link from out_dir to the file, url-encoded
-            return quote(os.path.relpath(src_abs, out_dir).replace(os.sep, '/'))
-
-        @classmethod
-        def FindCoverFile(cls, dirs):
-            # a COVER_STEMS name wins, else the first image that isn't a back scan
-            # (back.jpg is usually alphabetically first in a folder with both scans)
-            first = None
-            for d in sorted(dirs):
-                try: entries = sorted(os.listdir(d))
-                except OSError: continue
-                for f in entries:
-                    stem, ext = os.path.splitext(f)
-                    if ext.lower() not in gc.ImageExts: continue
-                    full = os.path.join(d, f)
-                    if not os.path.isfile(full): continue
-                    if stem.lower() in gc.CoverStems: return full
-                    if first is None and stem.lower() not in gc.BackStems: first = full
-            return first
-
-        @classmethod
-        def FindBackCoverFile(cls, dirs):
-            # only an explicit back name counts, no positional fallback
-            for d in sorted(dirs):
-                try: entries = sorted(os.listdir(d))
-                except OSError: continue
-                for f in entries:
-                    stem, ext = os.path.splitext(f)
-                    if ext.lower() in gc.ImageExts and stem.lower() in gc.BackStems \
-                            and os.path.isfile(os.path.join(d, f)):
-                        return os.path.join(d, f)
+        def Text(cls, raw, *keys):
+            for key in keys:
+                values = cls.TagValues(raw, key)
+                if any(v.strip() for v in values): return ', '.join(v for v in values if v.strip())
             return None
 
-        # ---------------------------------------------------------------- scanning
-        class Progress:
-            # thread-safe one-line stderr bar: [####----] 40/100  label  (rate, eta)
-            def __init__(self, total, label='', width=32):
-                self.total = max(total, 1); self.label = label; self.width = width
-                self.done = 0; self.start = time.monotonic()
-                self.lock = threading.Lock(); self.tty = sys.stderr.isatty()
-                self._draw()
-            def step(self, n=1):
-                with self.lock: self.done += n; self._draw()
-            def _draw(self):
-                frac = self.done / self.total
-                bar = '#' * int(self.width * frac) + '-' * (self.width - int(self.width * frac))
-                elapsed = time.monotonic() - self.start
-                rate = self.done / elapsed if elapsed > 0 else 0
-                eta = (self.total - self.done) / rate if rate > 0 else 0
-                if self.tty:
-                    sys.stderr.write('\r[%s] %d/%d  %s  (%.0f/s, eta %2ds)' % (bar, self.done, self.total, self.label, rate, eta))
-                    sys.stderr.flush()
-            def close(self):
-                with self.lock:
-                    if self.tty: sys.stderr.write('\r\033[K'); sys.stderr.flush()
+        @classmethod
+        def LvpTagsOf(cls, raw):
+            tags = []
+            for key in gc.LvpTagKeys:
+                for value in cls.TagValues(raw, key):
+                    for tag in cls.ParseTagList(value):
+                        if tag not in tags: tags.append(tag)
+            if tags: return tags
+            comment = (cls.Text(raw, 'comment', 'description') or '').lower()
+            return ['SL'] if 'studio leak' in comment else ['UR'] if 'unreleased' in comment else []
 
         @classmethod
-        def WalkAudio(cls, music_dir):
-            for dirpath, dirnames, filenames in os.walk(music_dir, followlinks=True):
-                dirnames[:] = sorted(d for d in dirnames if d.lower() not in gc.SkipDirs and not d.startswith('.'))
-                for name in sorted(filenames):
-                    if not name.startswith('.') and cls.IsAudio(name):
-                        yield os.path.join(dirpath, name)
+        def TrackID(cls, raw, path):
+            ids = [v.strip().lower() for key in gc.IdKeys for v in cls.TagValues(raw, key) if v.strip()]
+            if any(not re.fullmatch(r'[0-9a-f]{128}', v) for v in ids): raise cls.Error('%s: invalid LVP TrackID, expected exactly 128 hexadecimal characters' % path)
+            if len(set(ids)) > 1: raise cls.Error('%s: conflicting embedded LVP TrackIDs' % path)
+            return ids[0] if ids else None
 
         @classmethod
-        def BuildAlbums(cls, music_dir, out_dir, lyrics_map, workers=None, enable_rename=False, enable_lrc=True):
-            if workers is None: workers = gc.Workers
-            paths = list(cls.WalkAudio(music_dir))
+        def EmbedTrackID(cls, path, trackid):
+            cls.EnsureMutagen()
+            if not re.fullmatch(r'[0-9a-f]{128}', trackid): raise cls.Error('%s: invalid generated TrackID' % path)
+            ext = cls.SplitAudioExt(path)[1].lower(); fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.lvp-trackid-', suffix=ext, dir=os.path.dirname(path)); os.close(fd)
+            try:
+                shutil.copy2(path, tmp)
+                if ext == '.mp3':
+                    audio = MP3(tmp); audio.tags = audio.tags or ID3(); audio.tags.delall('TXXX:LVP_YZYWORKS_TRACKID'); audio.tags.add(TXXX(encoding=3, desc='LVP_YZYWORKS_TRACKID', text=trackid)); audio.save(v2_version=4)
+                elif ext == '.m4a':
+                    audio = MP4(tmp)
+                    if audio.tags is None: audio.add_tags()
+                    audio.tags['----:com.apple.iTunes:LVP_YZYWORKS_TRACKID'] = [MP4FreeForm(trackid.encode('utf-8'))]
+                    audio.save()
+                else:
+                    audio = FLAC(tmp); audio['LVP_YZYWORKS_TRACKID'] = [trackid]; audio.save()
+                scan = cls.ReadSource(tmp); layout = scan['layout']
+                if scan['embedded_id'] != trackid: raise cls.Error('%s: embedded TrackID verification failed' % path)
+                before = cls.ReadSource(path); before_layout = before['layout']
+                if cls.HashPayload(path, before_layout) != cls.HashPayload(tmp, layout) or before.get('payload_signature') != scan.get('payload_signature'):
+                    raise cls.Error('%s: embedding changed audio payload' % path)
+                with open(tmp, 'rb') as f: f.read(1)
+                return tmp
+            except Exception:
+                if os.path.exists(tmp): os.unlink(tmp)
+                raise
 
-            def _read(idx_path):
-                i, path = idx_path
-                try: tags, pic, back_pic = cls.ReadSong(path)
-                except Exception as e:
-                    print('\nskipping unreadable file: %s (%s)' % (path, e), file=sys.stderr)
-                    tags, pic, back_pic = {}, None, None
-                renamed = lrc_written = False; final_path = path
-                if enable_rename:
-                    target = cls.ComputeRenameTarget(path, tags)
-                    if target:
-                        if cls.RenameAudioWithLrc(path, target):
-                            renamed = True; final_path = target
-                            try: tags, pic, back_pic = cls.ReadSong(final_path)
-                            except Exception: pass
-                if enable_lrc: lrc_written = cls.WriteLrcFile(final_path, tags)
-                name = tags.get('album') or os.path.basename(os.path.dirname(final_path)) or gc.UnknownAlbum
-                song = {'no': cls.TrackNo(tags, i),
-                        'title': cls.CleanTitle(tags, os.path.basename(final_path)),
-                        'src': final_path,
-                        'tags': cls.LvpTagsOf(tags),
-                        'artist': tags.get('artist'),
-                        'album_artist': tags.get('albumartist'),
-                        'duration': cls.DurationOf(tags),
-                        'label': cls.LabelOf(tags)}
-                return name, os.path.dirname(final_path), cls.YearOf(tags), pic, back_pic, song, renamed, lrc_written
-
-            bar = cls.Progress(len(paths), 'reading tags')
-            groups = {}; rename_count = lrc_count = 0
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                for name, songdir, yr, pic, back_pic, song, renamed, lrc_written in pool.map(_read, enumerate(paths, 1)):
-                    g = groups.setdefault(name, {'year': '', 'cover': None, 'back': None, 'songs': [], 'dirs': set()})
-                    g['year'] = g['year'] or yr
-                    g['cover'] = g['cover'] or pic
-                    g['back'] = g['back'] or back_pic  # can come from a different track than the front
-                    g['dirs'].add(songdir); g['songs'].append(song)
-                    if renamed: rename_count += 1
-                    if lrc_written: lrc_count += 1
-                    bar.step()
-            bar.close()
-            print('read %d tracks across %d albums' % (len(paths), len(groups)), file=sys.stderr)
-            if enable_rename: print('renamed %d audio files' % rename_count, file=sys.stderr)
-            if enable_lrc: print('wrote %d .lrc files' % lrc_count, file=sys.stderr)
-
-            def _finish(item):
-                name, g = item
-                songs = sorted(g['songs'], key=lambda s: s['no'])
-                slug = cls.Slugify(name)
-                # lyrics: a `lyrics` marker file in any of the album's folders forces
-                # true, else carry the setting forward from the previous index.md
-                lyrics = False
-                for d in g['dirs']:
-                    try:
-                        if any(re.match(r'lyrics(\.|$)', f, re.I) for f in os.listdir(d)): lyrics = True; break
+        @classmethod
+        def EmbedTrackIDs(cls, root, state, keep_backups=None):
+            staged = []; backups = []
+            try:
+                for path, record in sorted(state['sources'].items()):
+                    if not record.get('active', True): continue
+                    trackid = record['id']; scan = cls.ReadSource(path)
+                    if scan['embedded_id'] == trackid: continue
+                    if scan['embedded_id'] is not None: raise cls.Error('%s: embedded TrackID conflicts with assigned identity' % path)
+                    staged.append((path, cls.EmbedTrackID(path, trackid)))
+                for path, tmp in staged:
+                    backup = path + '.lvp-backup-' + secrets.token_hex(8); shutil.copy2(path, backup); backups.append((path, backup)); os.replace(tmp, path)
+                if keep_backups is not None: keep_backups.extend(backups)
+                return len(staged)
+            except Exception:
+                for path, backup in reversed(backups):
+                    try: os.replace(backup, path)
                     except OSError: pass
-                lyrics = lyrics or lyrics_map.get(name, False)
+                raise
+            finally:
+                for _, tmp in staged:
+                    if os.path.exists(tmp): os.unlink(tmp)
+                if keep_backups is None:
+                    for _, backup in backups:
+                        if os.path.exists(backup): os.unlink(backup)
 
-                # cover: embedded art -> out_dir/covers/, else a cover image already
-                # in the album folder, referenced in place (same no-copy rule as tracks)
-                cover_rel, thumb_rel, src_bytes = '', '', None
-                if g['cover']:
-                    mime, img = g['cover']
-                    os.makedirs(os.path.join(out_dir, 'covers'), exist_ok=True)
-                    cover_rel = 'covers/%s%s' % (slug, cls.SniffImageExt(img, mime))
-                    with open(os.path.join(out_dir, cover_rel), 'wb') as f: f.write(img)
-                    src_bytes = img
-                else:
-                    found = cls.FindCoverFile(g['dirs'])
-                    if found:
-                        cover_rel = cls.RelUrl(found, out_dir)
-                        try:
-                            with open(found, 'rb') as f: src_bytes = f.read()
-                        except OSError: src_bytes = None
-                if cover_rel and src_bytes is not None:
-                    os.makedirs(os.path.join(out_dir, 'covers'), exist_ok=True)
-                    thumb_name = 'covers/%s-thumb.jpg' % slug
-                    if cls.MakeThumbnail(src_bytes, os.path.join(out_dir, thumb_name)): thumb_rel = thumb_name
-                thumb_rel = thumb_rel or cover_rel  # no downscaler or art already small -> reuse full art
+        @classmethod
+        def RenameSources(cls, root, state, keep_moves=None):
+            records = [(path, record['id']) for path, record in state['sources'].items() if record.get('active', True)]
+            moves = []; sources = {}; targets = {}
+            for path, trackid in records:
+                ext = cls.SplitAudioExt(path)[1]; target = os.path.join(os.path.dirname(path), trackid + ext)
+                stem, _ = cls.SplitAudioExt(path); targetstem, _ = cls.SplitAudioExt(target)
+                sidecars = []
+                candidates = ((stem + '.lrc', targetstem + '.lrc'),
+                              (os.path.splitext(path)[0] + '.lrc', os.path.splitext(target)[0] + '.lrc'),
+                              (stem + '.txt', targetstem + '.txt'))
+                for side, side_target in candidates:
+                    if os.path.isfile(side) and (side, side_target) not in sidecars: sidecars.append((side, side_target))
+                for source, destination in [(path, target)] + sidecars:
+                    source = os.path.abspath(source); destination = os.path.abspath(destination)
+                    if source in sources and sources[source] != destination: raise cls.Error('Rename source is used by multiple files: %s' % source)
+                    if destination in targets and targets[destination] != source: raise cls.Error('Rename targets collide: %s' % destination)
+                    sources[source] = destination; targets[destination] = source
+                    moves.append((source, destination))
+            source_paths = set(sources)
+            for source, destination in moves:
+                if os.path.lexists(destination) and destination not in source_paths: raise cls.Error('Rename target already exists: %s' % destination)
+            temps = []; committed = []
+            try:
+                for source, destination in moves:
+                    temp = source + '.lvp-rename-' + secrets.token_hex(8); os.replace(source, temp); temps.append((temp, source, destination))
+                for temp, source, destination in temps:
+                    os.makedirs(os.path.dirname(destination), exist_ok=True); os.replace(temp, destination); committed.append((temp, source, destination))
+                if keep_moves is not None:
+                    keep_moves.extend((source, destination) for _, source, destination in committed)
+                return len(records)
+            except Exception:
+                for temp, source, destination in reversed(committed):
+                    if os.path.lexists(destination):
+                        try: os.replace(destination, temp)
+                        except OSError: pass
+                for temp, source, destination in reversed(temps):
+                    if os.path.lexists(temp):
+                        try: os.replace(temp, source)
+                        except OSError: pass
+                raise
 
-                # back cover: type-4 picture first, then a back* file in the folder.
-                # no thumbnail, the reverse is only ever shown full-size on click
-                back_rel = ''
-                if g.get('back'):
-                    mime, img = g['back']
-                    os.makedirs(os.path.join(out_dir, 'covers'), exist_ok=True)
-                    back_rel = 'covers/%s-back%s' % (slug, cls.SniffImageExt(img, mime))
-                    with open(os.path.join(out_dir, back_rel), 'wb') as f: f.write(img)
-                else:
-                    found_back = cls.FindBackCoverFile(g['dirs'])
-                    if found_back: back_rel = cls.RelUrl(found_back, out_dir)
+        @classmethod
+        def ReadIndexDict(cls, root):
+            path = os.path.join(root, 'index.dict')
+            if os.path.islink(path): raise cls.Error('Refusing symlink source catalog: %s' % path)
+            try:
+                with open(path, encoding='utf-8') as f: value = ast.literal_eval(f.read())
+            except (OSError, SyntaxError, ValueError, MemoryError, RecursionError, UnicodeError) as e: raise cls.Error('%s: invalid literal catalog: %s' % (path, e)) from e
+            if not isinstance(value, dict): raise cls.Error('%s: source catalog must be a dictionary' % path)
+            return value
 
-                total_secs = sum(cls.DurationOf(s) for s in songs)
-                label = next((s['label'] for s in songs if s.get('label')), '')
-                return {'name': name, 'year': g['year'], 'slug': slug,
-                        'cover': cover_rel, 'thumb': thumb_rel, 'back': back_rel,
-                        'lyrics': lyrics, 'songs': songs,
-                        'author': cls.AlbumAuthor(songs),
-                        'duration': total_secs / 3600 if total_secs > 0 else 0.0,
-                        'label': label}
+        @classmethod
+        def WriteIndexDict(cls, root, catalog):
+            path = os.path.join(root, 'index.dict'); data = repr(catalog).encode('utf-8') + b'\n'; return cls.AtomicWrite(path, data)
 
-            bar = cls.Progress(len(groups), 'covers & thumbs')
+        @classmethod
+        def Collect(cls, root, rename=True):
+            root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
+            if not os.path.isdir(root): raise cls.Error('Source directory not found: %s' % root)
+            paths = list(cls.WalkAudio(root))
+            if not paths: raise cls.Error('No supported audio found under %s; nothing collected' % root)
+            scans = {}; bar = cls.Progress(len(paths), 'reading metadata')
+            try:
+                for path in paths:
+                    scan = cls.ReadSource(path); scan['generated'] = scan['embedded_id'] is None; scans[path] = scan; bar.step()
+            finally: bar.close()
+            used = {}
+            for path, scan in scans.items():
+                if scan['generated']: scan['embedded_id'] = secrets.token_hex(64)
+                tid = scan['embedded_id']
+                if tid in used: raise cls.Error('Duplicate TrackID %s in %s and %s; remove the duplicate input' % (tid, used[tid], path))
+                used[tid] = path
+            cls.EmbedTrackIDs(root, {'sources': {path: {'id': scan['embedded_id'], 'active': True} for path, scan in scans.items() if scan['generated']}})
+            if rename: cls.RenameSources(root, {'sources': {path: {'id': scan['embedded_id'], 'active': True} for path, scan in scans.items()}})
+            renamed = sum(1 for path, scan in scans.items() if os.path.basename(path) != scan['embedded_id'] + cls.SplitAudioExt(path)[1])
+            final = {}
+            for path, scan in scans.items():
+                ext = cls.SplitAudioExt(path)[1]; final[os.path.join(os.path.dirname(path), scan['embedded_id'] + ext) if rename else path] = scan
+            groups = {}
+            for path in final: groups.setdefault(cls.AlbumRoot(path, root), []).append(path)
             albums = []
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                for album in pool.map(_finish, list(groups.items())):
-                    albums.append(album); bar.step()
-            bar.close()
+            for folder in sorted(groups):
+                prop = os.path.join(folder, 'AlbumProperties'); props = cls.ParseProperties(prop)['values'] if os.path.isfile(prop) else {}
+                tracks = []; metas = []; front = back = None
+                for path in sorted(groups[folder]):
+                    scan = final[path]; meta = scan['metadata']; metas.append(meta); tid = scan['embedded_id']
+                    deps = cls.Dependencies(path, folder)
+                    front = front or deps['front']; back = back or deps['back']
+                    lyrics = {'timed': None, 'plain': None}
+                    for dep in deps['lyrics']:
+                        try:
+                            with open(dep, encoding='utf-8-sig') as f: text = f.read()
+                        except (OSError, UnicodeError) as e: raise cls.Error('%s: invalid lyric text: %s' % (dep, e)) from e
+                        key = 'timed' if cls.IsTimed(text) else 'plain'
+                        if lyrics[key] is None: lyrics[key] = os.path.relpath(dep, root).replace(os.sep, '/')
+                    tracks.append({'id': tid, 'title': meta['title'], 'artist': meta['artist'], 'album': meta['album'],
+                                   'track': meta['track']['number'], 'disc': meta['disc']['number'],
+                                   'duration_seconds': scan['tech']['duration_seconds'], 'categories': meta['categories'],
+                                   'path': os.path.relpath(path, root).replace(os.sep, '/'), 'lyrics': lyrics})
+                tracks.sort(key=lambda t: (t['disc'] or 0, t['track'] or 0, t['id']))
+                def pick(key): return next((m.get(key) for m in metas if m.get(key)), None)
+                album = {'name': pick('album') or os.path.basename(folder), 'artist': cls.AlbumArtist(metas),
+                         'release_date': pick('release_date'), 'label': pick('label'), 'copyright': pick('copyright'),
+                         'genre': cls.AlbumGenre(metas), 'description': props.get('description') or None,
+                         'duration_seconds': sum(t['duration_seconds'] for t in tracks),
+                         'folder': os.path.relpath(folder, root).replace(os.sep, '/'),
+                         'artwork': {'front': os.path.relpath(front, root).replace(os.sep, '/') if front else None,
+                                     'back': os.path.relpath(back, root).replace(os.sep, '/') if back else None},
+                         'properties': props, 'tracks': tracks}
+                for key in ('name', 'artist', 'release_date', 'label', 'copyright', 'genre', 'description'):
+                    if props.get(key, '').strip(): album[key] = props[key]
+                if props.get('author', '').strip(): album['artist'] = props['author']
+                albums.append(album)
+            return albums, {'albums': len(albums), 'tracks': len(final), 'embedded_trackids': sum(1 for s in scans.values() if s['generated']), 'renamed_tracks': renamed if rename else 0}
 
-            # newest first, albums without a year sort to the very end
-            albums.sort(key=lambda a: (0, -int(a['year']), a['name'].lower())
-                        if a['year'].isdigit() else (1, 0, a['name'].lower()))
-            return albums
+        @classmethod
+        def GenreOf(cls, raw):
+            raw = re.sub(r'\((?:\d+)\)', '', str(raw or '')).strip()
+            return '' if re.fullmatch(r'\d*', raw) else raw
 
-        # ---------------------------------------------------------------- main
+        @classmethod
+        def AlbumGenre(cls, songs):
+            seen, names = set(), []
+            for value in (s.get('genre') for s in songs if s.get('genre')):
+                for name in re.split(r'[;,/]+', value):
+                    name = ' '.join(name.split())
+                    if not name: continue
+                    key = name.casefold()
+                    if key in seen: continue
+                    seen.add(key); names.append(name)
+            return '; '.join(names) or None
+
+        @classmethod
+        def AlbumArtist(cls, metas):
+            explicit = next((m.get('album_artist') for m in metas if m.get('album_artist')), None)
+            if explicit: return explicit
+            counts = {}; first_seen = {}
+            for index, meta in enumerate(metas):
+                for name in re.split(r'[;,/&]+', meta.get('artist') or ''):
+                    name = ' '.join(name.split())
+                    if not name: continue
+                    key = name.casefold()
+                    first_seen.setdefault(key, (index, name)); counts[key] = counts.get(key, 0) + 1
+            top = sorted(counts, key=lambda key: (-counts[key], first_seen[key]))[:10]
+            return (', '.join(first_seen[key][1] for key in top)[:40].rstrip(' ,') or None)
+
+        @classmethod
+        def Number(cls, raw, key, *totals):
+            value = cls.Text(raw, key); current = total = None
+            if value:
+                m = re.fullmatch(r'\s*(\d+)(?:/(\d+))?\s*', value)
+                if m: current = int(m[1]); total = int(m[2]) if m[2] else None
+            other = cls.Text(raw, *totals)
+            if total is None and other and other.isdigit(): total = int(other)
+            return {'number': current, 'total': total}
+
+        @classmethod
+        def Normalize(cls, raw, filename):
+            title = cls.Text(raw, 'title'); inferred = False
+            if not title:
+                stem, _ = cls.SplitAudioExt(filename)
+                if not re.fullmatch(r'[0-9a-fA-F]{128}', stem): title = re.sub(r'^\s*\d+\s*[-.]?\s*', '', stem).strip() or None; inferred = bool(title)
+            return {'title': title, 'title_inferred_from_filename': inferred, 'album': cls.Text(raw, 'album'),
+                    'artist': cls.Text(raw, 'artist'), 'album_artist': cls.Text(raw, 'albumartist', 'album_artist'),
+                    'composer': cls.Text(raw, 'composer'), 'performer': cls.Text(raw, 'performer'),
+                    'release_date': cls.Text(raw, 'date', 'release_time', 'creation_time'), 'original_date': cls.Text(raw, 'originaldate', 'original_date'),
+                    'copyright': cls.Text(raw, 'copyright'), 'label': cls.Text(raw, *gc.LabelKeys),
+                    'genre': cls.GenreOf(cls.Text(raw, 'genre')) or None, 'rating': cls.Text(raw, 'rating'),
+                    'isrc': cls.Text(raw, 'isrc'), 'upc': cls.Text(raw, 'upc'),
+                    'track': cls.Number(raw, 'tracknumber', 'tracktotal', 'totaltracks'), 'disc': cls.Number(raw, 'discnumber', 'disctotal', 'totaldiscs'),
+                    'categories': cls.LvpTagsOf(raw)}
+
+        @classmethod
+        def SyncedLyrics(cls, frame):
+            if frame.format != 2: return None
+            lines = []
+            for text, stamp in frame.text:
+                if not 0 <= stamp <= 86400000: continue
+                cs = stamp // 10; text = text.replace('\n', ' ').replace('\r', ' ').strip()
+                if text: lines.append('[%02d:%02d.%02d]%s' % (cs // 6000, cs % 6000 // 100, cs % 100, text))
+            return '\n'.join(lines) or None
+
+        @classmethod
+        def MP4Data(cls, path, atom):
+            with open(path, 'rb') as f:
+                ok, data = atom.read(f)
+            if not ok: raise cls.Error('%s: truncated MP4 atom %s' % (path, atom.name.decode('latin1', 'replace')))
+            return data
+
+        @classmethod
+        def MP4Children(cls, atom, name): return [child for child in (atom.children or ()) if child.name == name]
+
+        @classmethod
+        def MP4Path(cls, atom, *names):
+            current = atom
+            for name in names:
+                current = next((child for child in current.children or () if child.name == name), None)
+                if current is None: return None
+            return current
+
+        @classmethod
+        def MP4Layout(cls, path):
+            cls.EnsureMutagen()
+            try:
+                with open(path, 'rb') as f: atoms = MP4Atoms(f)
+            except (OSError, MP4AtomError, ValueError) as e: raise cls.Error('%s: invalid MP4 container: %s' % (path, e)) from e
+            top = atoms.atoms; mdats = [a for a in top if a.name == b'mdat']
+            if not mdats: raise cls.Error('%s: MP4 has no media data' % path)
+            moov = next((a for a in top if a.name == b'moov'), None)
+            if moov is None: raise cls.Error('%s: MP4 has no movie metadata' % path)
+            tracks = cls.MP4Children(moov, b'trak'); audio_tracks = []
+            for track in tracks:
+                handler = cls.MP4Path(track, b'mdia', b'hdlr')
+                if handler is None: raise cls.Error('%s: MP4 track has no handler' % path)
+                data = cls.MP4Data(path, handler)
+                if len(data) < 12: raise cls.Error('%s: malformed MP4 handler' % path)
+                kind = data[8:12]
+                if kind == b'soun': audio_tracks.append(track)
+                else: raise cls.Error('%s: unsupported MP4 contains non-audio track' % path)
+            if len(audio_tracks) != 1: raise cls.Error('%s: MP4 must contain exactly one audio track' % path)
+            track = audio_tracks[0]; stbl = cls.MP4Path(track, b'mdia', b'minf', b'stbl')
+            stsd = cls.MP4Path(stbl, b'stsd') if stbl else None; stsc = cls.MP4Path(stbl, b'stsc') if stbl else None
+            stsz = cls.MP4Path(stbl, b'stsz') if stbl else None; stco = cls.MP4Path(stbl, b'stco') if stbl else None; co64 = cls.MP4Path(stbl, b'co64') if stbl else None
+            stts = cls.MP4Path(stbl, b'stts') if stbl else None
+            if not all((stsd, stsc, stsz, stco or co64, stts)): raise cls.Error('%s: MP4 audio sample tables are incomplete' % path)
+            stsd_data = cls.MP4Data(path, stsd)
+            if len(stsd_data) < 16: raise cls.Error('%s: malformed MP4 sample description' % path)
+            entry_count = int.from_bytes(stsd_data[4:8], 'big'); pos = 8; entries = []
+            for _ in range(entry_count):
+                if pos + 8 > len(stsd_data): raise cls.Error('%s: truncated MP4 sample description' % path)
+                length = int.from_bytes(stsd_data[pos:pos + 4], 'big')
+                if length < 8 or pos + length > len(stsd_data): raise cls.Error('%s: malformed MP4 sample entry' % path)
+                entries.append(stsd_data[pos:pos + length]); pos += length
+            if len(entries) != 1 or entries[0][4:8] not in (b'mp4a', b'alac'):
+                codec = entries[0][4:8].decode('latin1', 'replace') if entries else 'unknown'
+                raise cls.Error('%s: unsupported MP4 audio codec: %s' % (path, codec))
+            codec = 'alac' if entries[0][4:8] == b'alac' else 'aac'
+            def full(atom, label):
+                data = cls.MP4Data(path, atom)
+                if len(data) < 8: raise cls.Error('%s: malformed MP4 %s table' % (path, label))
+                return data
+            stsc_data = full(stsc, 'stsc'); count = int.from_bytes(stsc_data[4:8], 'big')
+            if len(stsc_data) != 8 + count * 12: raise cls.Error('%s: malformed MP4 stsc table' % path)
+            changes = [tuple(int.from_bytes(stsc_data[8 + i * 12 + j * 4:12 + i * 12 + j * 4], 'big') for j in range(3)) for i in range(count)]
+            if not changes or any(first < 1 or samples < 1 or desc != 1 for first, samples, desc in changes): raise cls.Error('%s: unsupported MP4 sample-to-chunk table' % path)
+            offset_atom = stco or co64; offset_data = full(offset_atom, 'chunk offset')
+            offset_width = 4 if stco else 8; chunk_count = int.from_bytes(offset_data[4:8], 'big')
+            if len(offset_data) != 8 + chunk_count * offset_width: raise cls.Error('%s: malformed MP4 chunk offset table' % path)
+            offsets = [int.from_bytes(offset_data[8 + i * offset_width:8 + (i + 1) * offset_width], 'big') for i in range(chunk_count)]
+            stsz_data = full(stsz, 'sample size'); fixed = int.from_bytes(stsz_data[4:8], 'big'); sample_count = int.from_bytes(stsz_data[8:12], 'big')
+            if fixed: sizes = [fixed] * sample_count
+            else:
+                if len(stsz_data) != 12 + sample_count * 4: raise cls.Error('%s: malformed MP4 sample sizes' % path)
+                sizes = [int.from_bytes(stsz_data[12 + i * 4:16 + i * 4], 'big') for i in range(sample_count)]
+            if not sample_count or any(size <= 0 for size in sizes): raise cls.Error('%s: MP4 has no usable audio samples' % path)
+            mdat_ranges = [(a._dataoffset, a.offset + a.length) for a in mdats]
+            def in_mdat(start, end): return next((base for base, limit in mdat_ranges if base <= start and end <= limit), None)
+            samples = []; sample_index = 0
+            for chunk_index, chunk_offset in enumerate(offsets, 1):
+                change = next((item for item in reversed(changes) if item[0] <= chunk_index), None)
+                count_in_chunk = change[1]
+                cursor = chunk_offset
+                for _ in range(count_in_chunk):
+                    if sample_index >= sample_count: raise cls.Error('%s: MP4 sample table has too many samples' % path)
+                    end = cursor + sizes[sample_index]; base = in_mdat(cursor, end)
+                    if base is None: raise cls.Error('%s: MP4 sample points outside media data' % path)
+                    samples.append((cursor, end)); cursor = end; sample_index += 1
+            if sample_index != sample_count: raise cls.Error('%s: MP4 sample table does not cover all samples' % path)
+            signature = cls.Digest({'codec': codec, 'stsd': stsd_data.hex(), 'stts': full(stts, 'time-to-sample').hex(), 'stsc': stsc_data.hex(), 'sizes': sizes,
+                                    'samples': [(start - next(base for base, limit in mdat_ranges if base <= start < limit), end - start) for start, end in samples]})
+            return {'start': samples[0][0], 'end': samples[-1][1], 'payload_ranges': samples, 'payload_signature': signature, 'blocks': [], 'codec': codec}
+
+        @classmethod
+        def MP4Raw(cls, path, tags, art, synced, plain):
+            mapping = {'©nam': 'title', '©alb': 'album', '©ART': 'artist', 'aART': 'albumartist', '©wrt': 'composer', '©day': 'date', '©gen': 'genre', 'cprt': 'copyright',
+                       '©cmt': 'comment', 'desc': 'description', '©too': 'encoder', 'soal': 'sort_album', 'soaa': 'sort_album_artist', 'soar': 'sort_artist', 'sonm': 'sort_name', 'soco': 'sort_composer', '©lyr': 'lyrics'}
+            raw = {}
+            def text(value):
+                if isinstance(value, bytes): return value.decode('utf-8')
+                return str(value)
+            for key, values in (tags or {}).items():
+                values = values if isinstance(values, list) else [values]
+                if key == 'covr':
+                    for value in values:
+                        art.add(3, 'image/jpeg' if getattr(value, 'imageformat', MP4Cover.FORMAT_JPEG) == MP4Cover.FORMAT_JPEG else 'image/png', bytes(value))
+                elif key == 'trkn' or key == 'disk':
+                    name = 'tracknumber' if key == 'trkn' else 'discnumber'
+                    for value in values:
+                        if not isinstance(value, (tuple, list)) or len(value) < 2: raise cls.Error('%s: malformed MP4 %s' % (path, key))
+                        raw.setdefault(name, []).append('%d/%d' % (value[0], value[1]) if value[1] else str(value[0]))
+                elif key.startswith('----:'):
+                    decoded = []
+                    for value in values:
+                        try: decoded.append(text(value))
+                        except UnicodeDecodeError as e: raise cls.Error('%s: invalid UTF-8 MP4 freeform tag %s' % (path, key)) from e
+                    raw.setdefault(key, []).extend(decoded)
+                elif key in mapping:
+                    raw.setdefault(mapping[key], []).extend(text(value) for value in values)
+                elif key in ('©lyr', 'lyrics'):
+                    for value in values:
+                        value = text(value); (synced if cls.IsTimed(value) else plain).append(value)
+                elif all(isinstance(value, (str, int, float, bool)) for value in values):
+                    raw.setdefault(key, []).extend(text(value) for value in values)
+            for key in ('lyrics', '©lyr'):
+                for value in raw.pop(key, []): (synced if cls.IsTimed(value) else plain).append(value)
+            return raw
+
+        @classmethod
+        def FlacLayout(cls, path):
+            size = os.path.getsize(path); blocks = []
+            with open(path, 'rb') as f:
+                head = f.read(10); start = 0
+                if head[:3] == b'ID3':
+                    if len(head) != 10 or head[3] not in (3, 4) or any(v & 128 for v in head[6:10]): raise cls.Error('%s: unsupported/malformed ID3 prefix (v2.3/v2.4 required)' % path)
+                    start = 10 + cls.Unsynchsafe(head[6:10]) + (10 if head[3] == 4 and head[5] & 16 else 0)
+                f.seek(start)
+                if f.read(4) != b'fLaC': raise cls.Error('%s: missing FLAC marker' % path)
+                while True:
+                    header = f.read(4)
+                    if len(header) != 4: raise cls.Error('%s: truncated FLAC metadata header' % path)
+                    kind = header[0] & 127; length = int.from_bytes(header[1:], 'big'); offset = f.tell()
+                    if offset + length > size: raise cls.Error('%s: truncated FLAC block' % path)
+                    if kind > 6: raise cls.Error('%s: unsupported FLAC metadata block %d' % (path, kind))
+                    if kind == 0 and blocks: raise cls.Error('%s: duplicate FLAC STREAMINFO' % path)
+                    if kind == 5: raise cls.Error('%s: FLAC CUESHEET is unsupported (contains descriptive subtrack metadata); split to tracks on a copy first' % path)
+                    if kind == 3 and length % 18: raise cls.Error('%s: malformed FLAC seek table' % path)
+                    if not blocks and (kind != 0 or length != 34): raise cls.Error('%s: invalid FLAC STREAMINFO' % path)
+                    blocks.append((kind, offset, length)); f.seek(length, 1)
+                    if header[0] & 128: break
+                end = size
+                if end - f.tell() < 2: raise cls.Error('%s: missing FLAC frames' % path)
+                payload = f.tell(); marker = f.read(2)
+                if marker[0] != 255 or marker[1] & 252 != 248: raise cls.Error('%s: invalid FLAC frame boundary' % path)
+                if end >= payload + 128:
+                    f.seek(end - 128)
+                    if f.read(3) == b'TAG': end -= 128
+                if end >= payload + 32:
+                    f.seek(end - 32); footer = f.read(32)
+                    if footer[:8] == b'APETAGEX':
+                        version, length, count, flags = struct.unpack('<4I', footer[8:24])
+                        if version not in (1000, 2000) or length < 32 or end - length < payload: raise cls.Error('%s: malformed trailing FLAC APEv2 footer' % path)
+                        end -= length
+                        if flags & 0x80000000:
+                            if end - 32 < payload: raise cls.Error('%s: truncated trailing FLAC APEv2 header' % path)
+                            f.seek(end - 32)
+                            if f.read(8) != b'APETAGEX': raise cls.Error('%s: missing trailing FLAC APEv2 header' % path)
+                            end -= 32
+            return {'start': payload, 'end': end, 'blocks': blocks}
+
+        @classmethod
+        def Unsynchsafe(cls, data): return sum(v << (7 * (3 - i)) for i, v in enumerate(data))
+
+        @classmethod
+        def Synchsafe(cls, value): return bytes((value >> 21 & 127, value >> 14 & 127, value >> 7 & 127, value & 127))
+
+        @classmethod
+        def Mp3Layout(cls, path):
+            size = os.path.getsize(path); start = 0; end = size; tagged = False
+            with open(path, 'rb') as f:
+                head = f.read(10)
+                if head[:3] == b'ID3':
+                    tagged = True
+                    if len(head) != 10 or head[3] not in (3, 4) or any(v & 128 for v in head[6:10]): raise cls.Error('%s: unsupported/malformed ID3 header (v2.3/v2.4 required)' % path)
+                    start = 10 + cls.Unsynchsafe(head[6:10]) + (10 if head[3] == 4 and head[5] & 16 else 0)
+                    if start > size: raise cls.Error('%s: truncated ID3 tag' % path)
+                if end >= 128:
+                    f.seek(end - 128)
+                    if f.read(3) == b'TAG': end -= 128
+                if end >= 32:
+                    f.seek(end - 32); footer = f.read(32)
+                    if footer[:8] == b'APETAGEX':
+                        version, length, count, flags = struct.unpack('<4I', footer[8:24])
+                        if version not in (1000, 2000) or length < 32 or end - length < start: raise cls.Error('%s: malformed APEv2 footer' % path)
+                        end -= length
+                        if flags & 0x80000000:
+                            if end - 32 < start: raise cls.Error('%s: truncated APEv2 header' % path)
+                            f.seek(end - 32)
+                            if f.read(8) != b'APETAGEX': raise cls.Error('%s: missing APEv2 header' % path)
+                            end -= 32
+                def frame(offset):
+                    if offset + 4 > end: return None
+                    f.seek(offset); header = f.read(4)
+                    h = int.from_bytes(header, 'big'); version = h >> 19 & 3; layer = h >> 17 & 3; br = h >> 12 & 15; sr = h >> 10 & 3
+                    if h >> 21 != 0x7ff or version == 1 or layer != 1 or br in (0, 15) or sr == 3: return None
+                    rate = (44100, 48000, 32000)[sr] // (1 if version == 3 else 2 if version == 2 else 4)
+                    bitrate = ((0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320) if version == 3 else
+                               (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160))[br] * 1000
+                    length = (144 if version == 3 else 72) * bitrate // rate + (h >> 9 & 1)
+                    return length, (rate, 1 if h >> 6 & 3 == 3 else 2)
+                def walk(offset, minimum):
+                    frames = 0; properties = None
+                    while offset < end:
+                        parsed = frame(offset)
+                        if parsed is None:
+                            if offset + 4 > end: raise cls.Error('%s: truncated MPEG frame' % path)
+                            raise cls.Error('%s: unsupported/non-frame MP3 bytes at %d (only framed MPEG Layer III is supported)' % (path, offset))
+                        length, props = parsed
+                        if offset + length > end: raise cls.Error('%s: truncated MPEG frame at %d' % (path, offset))
+                        if properties and properties != props: raise cls.Error('%s: varying MPEG sample rate/channels not supported' % path)
+                        properties = props; offset += length; frames += 1
+                    if frames < minimum: raise cls.Error('%s: missing MPEG audio frames' % path)
+                    return frames
+                parsed = frame(start)
+                if parsed is None and tagged:
+                    limit = min(end - 4, start + 4096)
+                    candidate = next((offset for offset in range(start + 1, limit + 1) if frame(offset) is not None), None)
+                    if candidate is None: raise cls.Error('%s: unsupported/non-frame MP3 bytes at %d (only framed MPEG Layer III is supported)' % (path, start))
+                    first = frame(candidate); cursor = candidate; properties = first[1]
+                    for _ in range(4):
+                        probe = frame(cursor)
+                        if probe is None or probe[1] != properties or cursor + probe[0] > end:
+                            raise cls.Error('%s: malformed MPEG frame sequence after leading metadata at %d' % (path, candidate))
+                        cursor += probe[0]
+                    start = candidate
+                walk(start, 2 if parsed is not None else 4)
+            return {'start': start, 'end': end, 'blocks': []}
+
+        @classmethod
+        def ReadSource(cls, path):
+            cls.EnsureMutagen()
+            ext = cls.SplitAudioExt(path)[1].lower(); layout = cls.Mp3Layout(path) if ext == '.mp3' else cls.MP4Layout(path) if ext == '.m4a' else cls.FlacLayout(path)
+            try:
+                mf = MP3(path) if ext == '.mp3' else MP4(path) if ext == '.m4a' else FLAC(path)
+                raw = {}; art = cls.ArtPicker(); synced = []; plain = []
+                if ext == '.m4a':
+                    raw = cls.MP4Raw(path, mf.tags, art, synced, plain)
+                    info = mf.info
+                    codec = layout['codec']
+                    tech = {'codec': codec, 'duration_seconds': info.length, 'sample_rate': info.sample_rate,
+                            'channels': info.channels, 'bit_depth': getattr(info, 'bits_per_sample', None),
+                            'bitrate': getattr(info, 'bitrate', None)}
+                    for key in ('lyrics', 'syncedlyrics', 'unsyncedlyrics', 'unsyncedlyric'):
+                        for text in cls.TagValues(raw, key):
+                            (synced if cls.IsTimed(text) else plain).append(text)
+                    return {'raw': raw, 'metadata': cls.Normalize(raw, os.path.basename(path)), 'tech': tech,
+                            'embedded_id': cls.TrackID(raw, path), 'front': art.front, 'back': art.back,
+                            'synced': synced, 'plain': plain, 'layout': layout, 'payload_signature': layout.get('payload_signature')}
+
+                if ext != '.mp3':
+                    for key, values in (mf.tags or {}).items():
+                        if cls.Key(key) == 'metadata_block_picture':
+                            for value in values:
+                                picture = mutagen.flac.Picture(base64.b64decode(value, validate=True)); art.add(picture.type, picture.mime, picture.data)
+                        elif cls.Key(key) in ('coverart', 'coverartmime'): raise cls.Error('%s: unsupported legacy base64 coverart comment; use native FLAC PICTURE blocks' % path)
+                        else: raw[key] = list(values)
+                    for picture in mf.pictures: art.add(picture.type, picture.mime, picture.data)
+                else:
+                    for key, frame in (mf.tags or {}).items():
+                        fid = frame.FrameID
+                        if fid in ('APIC', 'PIC'):
+                            if fid == 'PIC':
+                                mime = {'JPG': 'image/jpeg', 'PNG': 'image/png', 'GIF': 'image/gif'}.get(getattr(frame, 'mime', ''), getattr(frame, 'mime', ''))
+                                art.add(frame.type, mime, frame.data)
+                            else: art.add(frame.type, frame.mime, frame.data)
+                        elif fid in ('USLT', 'ULT'):
+                            text = frame.text if isinstance(frame.text, str) else getattr(frame, 'text', '')
+                            (synced if cls.IsTimed(text) else plain).append(text)
+                        elif fid == 'SYLT':
+                            text = cls.SyncedLyrics(frame)
+                            if text: synced.append(text)
+                        elif fid == 'COMM': raw.setdefault('comment', []).extend(str(v) for v in frame.text)
+                        elif hasattr(frame, 'text'):
+                            name = frame.desc if fid == 'TXXX' else gc.Id3Map.get(fid, fid)
+                            raw.setdefault(name, []).extend(str(v) for v in frame.text)
+                        elif fid in ('TIPL', 'TMCL'): raw[fid] = [json.dumps(frame.people, ensure_ascii=False)]
+                    try:
+                        ape = APEv2(path)
+                        for key, value in ape.items():
+                            if value.kind == 0: raw.setdefault(key, []).extend(str(value).split('\0'))
+                    except APENoHeaderError: pass
+                for key in ('syncedlyrics', 'lyrics', 'unsyncedlyrics', 'unsyncedlyric'):
+                    for text in cls.TagValues(raw, key):
+                        (synced if cls.IsTimed(text) else plain).append(text)
+                if ext != '.mp3' and layout['blocks'][0][1] > 8:
+                    prefix = ID3(path)
+                    for frame in prefix.getall('TXXX'): raw.setdefault(frame.desc, []).extend(str(v) for v in frame.text)
+                    if any(frame.FrameID != 'TXXX' for frame in prefix.values()):
+                        raise cls.Error('%s: descriptive ID3 prefix on FLAC is unsupported; convert its tags to native FLAC tags on a copy' % path)
+                info = mf.info
+                tech = {'codec': 'mp3' if ext == '.mp3' else 'flac', 'duration_seconds': info.length,
+                        'sample_rate': info.sample_rate, 'channels': info.channels, 'bit_depth': getattr(info, 'bits_per_sample', None),
+                        'bitrate': getattr(info, 'bitrate', None)}
+                return {'raw': raw, 'metadata': cls.Normalize(raw, os.path.basename(path)), 'tech': tech, 'embedded_id': cls.TrackID(raw, path),
+                        'front': art.front, 'back': art.back, 'synced': synced, 'plain': plain, 'layout': layout}
+            except cls.Error: raise
+            except Exception as e: raise cls.Error('%s: metadata extraction failed: %s' % (path, e)) from e
+
+        @classmethod
+        def IsTimed(cls, text): return bool(re.search(r'\[\d+:\d{2}(?:[.:]\d+)?\]', text))
+
+        @classmethod
+        def Dependencies(cls, path, albumroot):
+            folder = os.path.dirname(path); stem, _ = cls.SplitAudioExt(os.path.basename(path)); candidates = [os.path.join(folder, stem + '.lrc'), os.path.splitext(path)[0] + '.lrc', os.path.join(folder, stem + '.txt')]
+            dirs = sorted(set((folder, albumroot))); front = back = None
+            for d in dirs:
+                images = []
+                for name in sorted(os.listdir(d)):
+                    base, ext = os.path.splitext(name); full = os.path.join(d, name)
+                    if ext.lower() in gc.ImageExts and os.path.isfile(full): images.append((base.lower(), full))
+                if not front: front = next((p for b, p in images if b in gc.CoverStems), None) or next((p for b, p in images if b not in gc.BackStems), None)
+                if not back: back = next((p for b, p in images if b in gc.BackStems), None)
+            lyrics = list(dict.fromkeys(p for p in candidates if os.path.isfile(p)))
+            paths = lyrics + [p for p in (front, back) if p]
+            for p in paths:
+                if os.path.islink(p): raise cls.Error('Refusing source sidecar symlink: %s' % p)
+            return {'front': front, 'back': back, 'lyrics': lyrics}
+
+        @classmethod
+        def ExportLegacy(cls, out):
+            catalog = cls.ReadIndexDict(out)
+            lines = ['# yzyworks.com']
+            lines += ['%s: %s' % (k, str(v).replace('\n', ' ')) for k, v in catalog.get('library', {}).get('properties', {}).items()]
+            for album in catalog.get('albums', []):
+                art = album.get('artwork') or {}; lines += ['', '---']
+                if art.get('front'): lines.append('> ![](%s)' % quote(art['front']))
+                lines.append('> ' + (album.get('name') or 'Unknown album').replace('\n', ' '))
+                for key, value in (('year', (album.get('release_date') or '')[:4]), ('author', album.get('artist')), ('genre', album.get('genre')), ('label', album.get('label'))):
+                    if value: lines.append('%s: %s' % (key, str(value).replace('\n', ' ')))
+                lines.append('duration: %.4f' % ((album.get('duration_seconds') or 0) / 3600))
+                lines.append('lyrics: ' + ('yes' if any((t.get('lyrics') or {}).get('timed') for t in album.get('tracks', [])) else 'no'))
+                for i, track in enumerate(album.get('tracks', []), 1):
+                    title = (track.get('title') or 'Untitled').replace('\n', ' ')
+                    if track.get('artist'): title += ' [by %s]' % track['artist'].replace('\n', ' ')
+                    lines.append('%d. %s — %s%s' % (i, title, quote(track['path']), ''.join(' [%s]' % t for t in track.get('categories', []))))
+            cls.AtomicWrite(os.path.join(out, 'index.md'), ('\n'.join(lines) + '\n').encode('utf-8'))
+            return len(catalog.get('albums', [])), sum(len(a.get('tracks', [])) for a in catalog.get('albums', []))
+
         @classmethod
         def Run(cls):
-            ap = argparse.ArgumentParser(description='Index a music library (recursive) into '
-                                                     'index.md + covers, tracks referenced in place.')
-            ap.add_argument('music_dir', help='folder to scan recursively for audio')
-            ap.add_argument('--out', default='.', help='project root to write into (default: cwd)')
-            ap.add_argument('--workers', type=int, default=gc.Workers,
-                            help='parallel worker threads (default: %d on this machine)' % gc.Workers)
-            ap.add_argument('--rename', action='store_true',
-                            help='rename audio files to "{title} - {artist}{ext}", missing fields '
-                                 'filled by random hex, collisions get a hex suffix')
-            ap.add_argument('--no-lrc', dest='lrc', action='store_false', default=True,
-                            help='skip writing .lrc files from embedded lyrics (default: enabled)')
+            ap = argparse.ArgumentParser(description='Collect library metadata, or push collected metadata into index.md.')
+            ap.add_argument('--version', action='version', version=Main.Version.BuildShow)
+            sub = ap.add_subparsers(dest='command', required=True)
+            collect = sub.add_parser('collect', help='collect metadata (artist, track name, TrackID, ...) from a source directory')
+            collect.add_argument('dir', nargs='?', default='.', help='source directory')
+            collect.add_argument('--do-not-rename', action='store_true', help='keep source filenames instead of renaming audio (and .lrc/.txt sidecars) to their TrackIDs')
+            push = sub.add_parser('push-index', help='index a collected directory into index.md')
+            push.add_argument('dir', nargs='?', default='.', help='directory containing collected index.dict')
             args = ap.parse_args()
-
-            music_dir = os.path.abspath(os.path.expanduser(args.music_dir))
-            out_dir = os.path.abspath(os.path.expanduser(args.out))
-            os.makedirs(out_dir, exist_ok=True)
-            if not os.path.isdir(music_dir): sys.exit('music dir not found: %s' % music_dir)
-
-            lyrics_map = cls.ReadExistingLyrics(os.path.join(out_dir, 'index.md'))
-            albums = cls.BuildAlbums(music_dir, out_dir, lyrics_map, workers=max(1, args.workers),
-                                     enable_rename=args.rename, enable_lrc=args.lrc)
-            if not albums: sys.exit('no audio found under %s' % music_dir)
-
-            # no tagline, nothing human reads index.md. the header carries the
-            # indexer rules instead, which the viewer ignores (everything above
-            # the first '---')
-            rules = cls.ReadIndexerRules(out_dir)
-            lines = ['# yzyworks.com'] + ([''] + rules if rules else [])
-            for a in albums:
-                lines.append(''); lines.append('---')
-                if a['cover']: lines.append('> ![](%s)' % a['cover'])
-                if a.get('thumb') and a['thumb'] != a['cover']: lines.append('thumb: %s' % a['thumb'])
-                if a.get('back') and a['back'] != a['cover']: lines.append('back: %s' % a['back'])
-                lines.append('> %s' % a['name'])
-                if a['year']: lines.append('year: %s' % a['year'])
-                if a['author']: lines.append('author: %s' % a['author'])
-                lines.append('lyrics: %s' % ('yes' if a['lyrics'] else 'no'))
-                if a.get('duration'): lines.append('duration: %.4f' % a['duration'])
-                if a.get('label'): lines.append('label: %s' % a['label'])
-                for i, s in enumerate(a['songs'], 1):
-                    tag_str = ''.join(' [%s]' % t for t in s.get('tags', []))
-                    lines.append('%d. %s — %s%s' % (i, s['title'], cls.RelUrl(s['src'], out_dir), tag_str))
-
-            with open(os.path.join(out_dir, 'index.md'), 'w', encoding='utf-8') as f:
-                f.write('\n'.join(lines) + '\n')
-
-            tracks = sum(len(a['songs']) for a in albums)
-            covers = sum(1 for a in albums if a['cover'])
-            backs = sum(1 for a in albums if a.get('back'))
-            print('Wrote index.md — %d albums, %d tracks, %d covers extracted (%d with a back cover)%s.' %
-                  (len(albums), tracks, covers, backs,
-                   '' if gc.HaveMutagen else ' (built-in parser; install mutagen for more formats)'))
-
+            try:
+                if args.command == 'collect':
+                    cls.EnsureMutagen()
+                    root = os.path.realpath(os.path.abspath(os.path.expanduser(args.dir)))
+                    albums, counters = cls.Collect(root, not args.do_not_rename)
+                    cls.WriteIndexDict(root, {'library': {'properties': cls.LibraryProperties(cls.ReadRules(root))}, 'albums': albums})
+                    print('Collected %d albums, %d tracks into %s' % (len(albums), counters['tracks'], os.path.join(root, 'index.dict')))
+                    print('Next: %s push-index %s' % (os.path.abspath(sys.argv[0]), root))
+                    print('Counters: ' + json.dumps(counters, sort_keys=True)); return 0
+                prepared = os.path.abspath(os.path.expanduser(args.dir))
+                if not os.path.isfile(os.path.join(prepared, 'index.dict')): raise cls.Error('No index.dict. Run collect first: %s' % prepared)
+                albums, tracks = cls.ExportLegacy(prepared)
+                print('Indexed %d albums, %d tracks into %s' % (albums, tracks, os.path.join(prepared, 'index.md'))); return 0
+            except (cls.Error, OSError, ValueError, KeyError, ImportError) as e:
+                print('Indexer failed: %s' % e, file=sys.stderr); return 1
 
 # Init
 gc = Main.GlobalCache
 act = Main.Activities
 # Main
-if __name__ == '__main__': act.Run()
+if __name__ == '__main__': sys.exit(act.Run())
