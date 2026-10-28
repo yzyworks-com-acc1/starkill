@@ -28,6 +28,7 @@
 - **ARM64, x86_64 device** _(`archabi-v7a` is not supported for now, v2.1 release will support it)_
 
 # Other
+- [**App Documentaion on sertain things**](AppDocumentationQAtypa.md)
 - [**Self-Hosting Full Guide/Instructions**](SetupSelfHostedSolution.md)
 - [**Build-in libraries**](BuildIn_Libraries.md)
 - [**LVP Tags Documentation** _(related to Self-Hosting solution, recommended to use with)_](LVP_TagsDocumentation.md)
