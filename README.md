@@ -23,7 +23,9 @@
 - **Lightweight** _(by performance && app size)_
 - **Listening statistics** _(how much was spent listening to artist/playlist/track/album per day/weeks/months/all time)_
 
-#### All releases support any Android architecture _(like v8, v7a, x86_64 and other)_
+## Supported devices:
+- **Android version 8.0 and higher** _(minimal SDK version 26)_
+- **ARM64, x86_64 device** _(`archabi-v7a` is not supported for now, v2.1 release will support it)_
 
 # Other
 - [**Self-Hosting Full Guide/Instructions**](SetupSelfHostedSolution.md)
