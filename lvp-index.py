@@ -122,6 +122,14 @@ class Main:
             return {'values': values, 'raw': raw}
 
         @classmethod
+        def LyricsOverride(cls, props, source):
+            if 'lyrics' not in props: return None
+            value = props['lyrics'].strip().lower()
+            if value not in ('yes', 'no'):
+                raise cls.Error('%s: lyrics must be yes or no' % source)
+            return value == 'yes'
+
+        @classmethod
         def ReadRules(cls, root):
             path = os.path.join(root, 'LVP_IndexerRules')
             return cls.ParseProperties(path)['values'] if os.path.isfile(path) else {}
@@ -202,6 +210,16 @@ class Main:
             while True:
                 if os.path.isfile(os.path.join(current, 'AlbumProperties')): return current
                 if current == root: return folder
+                current = os.path.dirname(current)
+
+        @classmethod
+        def ArtistPoolKey(cls, path, root, album):
+            folder = cls.AlbumRoot(path, root); name = ' '.join((album or '').split()).casefold()
+            if not name or os.path.isfile(os.path.join(folder, 'AlbumProperties')): return folder, name
+            current = os.path.dirname(path)
+            while True:
+                if ' '.join(os.path.basename(current).split()).casefold() == name: return current, name
+                if current == root: return folder, name
                 current = os.path.dirname(current)
 
         @classmethod
@@ -363,11 +381,18 @@ class Main:
             path = os.path.join(root, 'index.dict'); data = repr(catalog).encode('utf-8') + b'\n'; return cls.AtomicWrite(path, data)
 
         @classmethod
-        def Collect(cls, root, rename=True):
+        def Collect(cls, root, rename=True, out=None):
             root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
+            out = os.path.realpath(os.path.abspath(out)) if out is not None else root
             if not os.path.isdir(root): raise cls.Error('Source directory not found: %s' % root)
             paths = list(cls.WalkAudio(root))
             if not paths: raise cls.Error('No supported audio found under %s; nothing collected' % root)
+            # AlbumProperties is the editable override input; validate before modifying audio or outputs.
+            properties = {}
+            for folder in sorted({cls.AlbumRoot(path, root) for path in paths}):
+                prop = os.path.join(folder, 'AlbumProperties')
+                props = cls.ParseProperties(prop)['values'] if os.path.isfile(prop) else {}
+                cls.LyricsOverride(props, prop); properties[folder] = props
             scans = {}; bar = cls.Progress(len(paths), 'reading metadata')
             try:
                 for path in paths:
@@ -385,40 +410,49 @@ class Main:
             final = {}
             for path, scan in scans.items():
                 ext = cls.SplitAudioExt(path)[1]; final[os.path.join(os.path.dirname(path), scan['embedded_id'] + ext) if rename else path] = scan
-            groups = {}
-            for path in final: groups.setdefault(cls.AlbumRoot(path, root), []).append(path)
-            albums = []
+            groups = {}; artist_pools = {}
+            for path in sorted(final):
+                meta = final[path]['metadata']; groups.setdefault(cls.AlbumRoot(path, root), []).append(path)
+                artist_pools.setdefault(cls.ArtistPoolKey(path, root, meta.get('album')), []).append(meta)
+            albums = []; artwork_names = {}
             for folder in sorted(groups):
-                prop = os.path.join(folder, 'AlbumProperties'); props = cls.ParseProperties(prop)['values'] if os.path.isfile(prop) else {}
-                tracks = []; metas = []; front = back = None
+                prop = os.path.join(folder, 'AlbumProperties'); props = properties[folder]
+                tracks = []; metas = []; front = back = embedded_front = embedded_back = None
                 for path in sorted(groups[folder]):
                     scan = final[path]; meta = scan['metadata']; metas.append(meta); tid = scan['embedded_id']
                     deps = cls.Dependencies(path, folder)
                     front = front or deps['front']; back = back or deps['back']
+                    embedded_front = embedded_front or scan['front']; embedded_back = embedded_back or scan['back']
                     lyrics = {'timed': None, 'plain': None}
                     for dep in deps['lyrics']:
                         try:
                             with open(dep, encoding='utf-8-sig') as f: text = f.read()
                         except (OSError, UnicodeError) as e: raise cls.Error('%s: invalid lyric text: %s' % (dep, e)) from e
                         key = 'timed' if cls.IsTimed(text) else 'plain'
-                        if lyrics[key] is None: lyrics[key] = os.path.relpath(dep, root).replace(os.sep, '/')
+                        if lyrics[key] is None: lyrics[key] = os.path.relpath(dep, out).replace(os.sep, '/')
                     tracks.append({'id': tid, 'title': meta['title'], 'artist': meta['artist'], 'album': meta['album'],
                                    'track': meta['track']['number'], 'disc': meta['disc']['number'],
                                    'duration_seconds': scan['tech']['duration_seconds'], 'categories': meta['categories'],
-                                   'path': os.path.relpath(path, root).replace(os.sep, '/'), 'lyrics': lyrics})
-                tracks.sort(key=lambda t: (t['disc'] or 0, t['track'] or 0, t['id']))
+                                   'path': os.path.relpath(path, out).replace(os.sep, '/'), 'lyrics': lyrics})
                 def pick(key): return next((m.get(key) for m in metas if m.get(key)), None)
-                album = {'name': pick('album') or os.path.basename(folder), 'artist': cls.AlbumArtist(metas),
+                name = props['name'] if props.get('name', '').strip() else pick('album') or os.path.basename(folder)
+                front = cls.WriteArtwork(out, embedded_front, name, used=artwork_names) if embedded_front else cls.CopyArtwork(out, front, name, used=artwork_names) if front and out != root else front
+                back = cls.WriteArtwork(out, embedded_back, name, 'back', artwork_names) if embedded_back else cls.CopyArtwork(out, back, name, 'back', artwork_names) if back and out != root else back
+                tracks.sort(key=lambda t: (t['disc'] or 0, t['track'] or 0, t['id']))
+                tagged_path = next((path for path in groups[folder] if final[path]['metadata'].get('album')), groups[folder][0])
+                pool = metas if os.path.isfile(prop) else artist_pools[cls.ArtistPoolKey(tagged_path, root, pick('album'))]
+                album = {'name': pick('album') or os.path.basename(folder), 'artist': cls.AlbumArtist(pool),
                          'release_date': pick('release_date'), 'label': pick('label'), 'copyright': pick('copyright'),
                          'genre': cls.AlbumGenre(metas), 'description': props.get('description') or None,
                          'duration_seconds': sum(t['duration_seconds'] for t in tracks),
-                         'folder': os.path.relpath(folder, root).replace(os.sep, '/'),
-                         'artwork': {'front': os.path.relpath(front, root).replace(os.sep, '/') if front else None,
-                                     'back': os.path.relpath(back, root).replace(os.sep, '/') if back else None},
+                         'folder': os.path.relpath(folder, out).replace(os.sep, '/'),
+                         'artwork': {'front': os.path.relpath(front, out).replace(os.sep, '/') if front else None,
+                                     'back': os.path.relpath(back, out).replace(os.sep, '/') if back else None},
                          'properties': props, 'tracks': tracks}
                 for key in ('name', 'artist', 'release_date', 'label', 'copyright', 'genre', 'description'):
                     if props.get(key, '').strip(): album[key] = props[key]
                 if props.get('author', '').strip(): album['artist'] = props['author']
+                if props.get('year', '').strip() and not props.get('release_date', '').strip(): album['release_date'] = props['year'].strip()
                 albums.append(album)
             return albums, {'albums': len(albums), 'tracks': len(final), 'embedded_trackids': sum(1 for s in scans.values() if s['generated']), 'renamed_tracks': renamed if rename else 0}
 
@@ -443,15 +477,16 @@ class Main:
         def AlbumArtist(cls, metas):
             explicit = next((m.get('album_artist') for m in metas if m.get('album_artist')), None)
             if explicit: return explicit
-            counts = {}; first_seen = {}
-            for index, meta in enumerate(metas):
+            counts = {}; names = {}
+            for meta in metas:
+                seen = set()
                 for name in re.split(r'[;,/&]+', meta.get('artist') or ''):
                     name = ' '.join(name.split())
                     if not name: continue
                     key = name.casefold()
-                    first_seen.setdefault(key, (index, name)); counts[key] = counts.get(key, 0) + 1
-            top = sorted(counts, key=lambda key: (-counts[key], first_seen[key]))[:10]
-            return (', '.join(first_seen[key][1] for key in top)[:40].rstrip(' ,') or None)
+                    if key in seen: continue
+                    seen.add(key); names.setdefault(key, name); counts[key] = counts.get(key, 0) + 1
+            return names[max(counts, key=counts.get)] if counts else None
 
         @classmethod
         def Number(cls, raw, key, *totals):
@@ -795,6 +830,31 @@ class Main:
             except Exception as e: raise cls.Error('%s: metadata extraction failed: %s' % (path, e)) from e
 
         @classmethod
+        def WriteArtwork(cls, root, picture, name, role='front', used=None):
+            mime, data = picture
+            if data[:3] == b'\xff\xd8\xff': ext = '.jpg'
+            elif data[:8] == b'\x89PNG\r\n\x1a\n': ext = '.png'
+            elif data[:4] == b'RIFF' and data[8:12] == b'WEBP': ext = '.webp'
+            elif data[:6] in (b'GIF87a', b'GIF89a'): ext = '.gif'
+            else: ext = {'image/png': '.png', 'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'image/webp': '.webp', 'image/gif': '.gif'}.get((mime or '').lower(), '.jpg')
+            folder = os.path.join(root, 'covers')
+            if os.path.islink(folder): raise cls.Error('Refusing artwork directory symlink: %s' % folder)
+            stem = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', '_', str(name or '')).strip().rstrip('. ') or 'album'
+            stem = stem.encode('utf-8')[:180].decode('utf-8', 'ignore').rstrip('. ') or 'album'
+            if role != 'front': stem += '-' + role
+            used = {} if used is None else used; digest = hashlib.sha256(data).hexdigest(); candidate = stem; number = 1
+            while candidate.casefold() in used:
+                previous, path = used[candidate.casefold()]
+                if previous == (digest, ext): return path
+                number += 1; candidate = '%s-%d' % (stem, number)
+            path = os.path.join(folder, candidate + ext)
+            cls.AtomicWrite(path, data); used[candidate.casefold()] = ((digest, ext), path); return path
+
+        @classmethod
+        def CopyArtwork(cls, out, path, name, role='front', used=None):
+            with open(path, 'rb') as f: return cls.WriteArtwork(out, ('image/' + os.path.splitext(path)[1][1:].lower(), f.read()), name, role, used)
+
+        @classmethod
         def IsTimed(cls, text): return bool(re.search(r'\[\d+:\d{2}(?:[.:]\d+)?\]', text))
 
         @classmethod
@@ -815,18 +875,36 @@ class Main:
             return {'front': front, 'back': back, 'lyrics': lyrics}
 
         @classmethod
-        def ExportLegacy(cls, out):
-            catalog = cls.ReadIndexDict(out)
+        def ExportLegacy(cls, root, out=None):
+            root = os.path.realpath(os.path.abspath(root)); out = os.path.realpath(os.path.abspath(out)) if out is not None else root
+            catalog = cls.ReadIndexDict(root)
+            artwork_names = {}
+            if root != out:
+                for album in catalog.get('albums', []):
+                    if album.get('folder'): album['folder'] = os.path.relpath(os.path.join(root, album['folder']), out).replace(os.sep, '/')
+                    for key, path in (album.get('artwork') or {}).items():
+                        if path: album['artwork'][key] = os.path.relpath(cls.CopyArtwork(out, os.path.join(root, path), album.get('name'), key, artwork_names), out).replace(os.sep, '/')
+                    for track in album.get('tracks', []):
+                        track['path'] = os.path.relpath(os.path.join(root, track['path']), out).replace(os.sep, '/')
+                        for key, path in (track.get('lyrics') or {}).items():
+                            if path: track['lyrics'][key] = os.path.relpath(os.path.join(root, path), out).replace(os.sep, '/')
             lines = ['# yzyworks.com']
             lines += ['%s: %s' % (k, str(v).replace('\n', ' ')) for k, v in catalog.get('library', {}).get('properties', {}).items()]
             for album in catalog.get('albums', []):
                 art = album.get('artwork') or {}; lines += ['', '---']
                 if art.get('front'): lines.append('> ![](%s)' % quote(art['front']))
                 lines.append('> ' + (album.get('name') or 'Unknown album').replace('\n', ' '))
+                if art.get('back') and art['back'] != art.get('front'): lines.append('back: %s' % quote(art['back']))
                 for key, value in (('year', (album.get('release_date') or '')[:4]), ('author', album.get('artist')), ('genre', album.get('genre')), ('label', album.get('label'))):
                     if value: lines.append('%s: %s' % (key, str(value).replace('\n', ' ')))
+                props = album.get('properties') or {}
+                for key in ('copyright', 'description', 'metadata-standart-rating', 'credits-tracklist', 'credits-source', 'metadata-last-edit-date'):
+                    value = album.get(key) if key in ('copyright', 'description') else props.get(key)
+                    if value: lines.append('%s: %s' % (key, str(value).replace('\n', ' ')))
                 lines.append('duration: %.4f' % ((album.get('duration_seconds') or 0) / 3600))
-                lines.append('lyrics: ' + ('yes' if any((t.get('lyrics') or {}).get('timed') for t in album.get('tracks', [])) else 'no'))
+                lyrics = cls.LyricsOverride(props, 'AlbumProperties snapshot for %s' % album.get('folder', album.get('name', 'album')))
+                if lyrics is None: lyrics = any((t.get('lyrics') or {}).get('timed') for t in album.get('tracks', []))
+                lines.append('lyrics: ' + ('yes' if lyrics else 'no'))
                 for i, track in enumerate(album.get('tracks', []), 1):
                     title = (track.get('title') or 'Untitled').replace('\n', ' ')
                     if track.get('artist'): title += ' [by %s]' % track['artist'].replace('\n', ' ')
@@ -836,28 +914,30 @@ class Main:
 
         @classmethod
         def Run(cls):
+            invocation_dir = os.getcwd()
             ap = argparse.ArgumentParser(description='Collect library metadata, or push collected metadata into index.md.')
             ap.add_argument('--version', action='version', version=Main.Version.BuildShow)
             sub = ap.add_subparsers(dest='command', required=True)
-            collect = sub.add_parser('collect', help='collect metadata (artist, track name, TrackID, ...) from a source directory')
-            collect.add_argument('dir', nargs='?', default='.', help='source directory')
+            collect = sub.add_parser('collect', help='collect metadata and regenerate index.dict and index.md from a source directory')
+            collect.add_argument('dir', nargs='?', default='.', help='audio source directory (default: invocation working directory); index.dict, index.md and covers always go in the invocation working directory')
             collect.add_argument('--do-not-rename', action='store_true', help='keep source filenames instead of renaming audio (and .lrc/.txt sidecars) to their TrackIDs')
             push = sub.add_parser('push-index', help='index a collected directory into index.md')
-            push.add_argument('dir', nargs='?', default='.', help='directory containing collected index.dict')
+            push.add_argument('dir', nargs='?', default='.', help='catalog directory containing index.dict (default: invocation working directory); index.md and copied covers always go in the invocation working directory')
             args = ap.parse_args()
             try:
+                root = os.path.realpath(os.path.join(invocation_dir, os.path.expanduser(args.dir)))
                 if args.command == 'collect':
                     cls.EnsureMutagen()
-                    root = os.path.realpath(os.path.abspath(os.path.expanduser(args.dir)))
-                    albums, counters = cls.Collect(root, not args.do_not_rename)
-                    cls.WriteIndexDict(root, {'library': {'properties': cls.LibraryProperties(cls.ReadRules(root))}, 'albums': albums})
-                    print('Collected %d albums, %d tracks into %s' % (len(albums), counters['tracks'], os.path.join(root, 'index.dict')))
-                    print('Next: %s push-index %s' % (os.path.abspath(sys.argv[0]), root))
+                    albums, counters = cls.Collect(root, not args.do_not_rename, out=invocation_dir)
+                    # Both files are generated snapshots, never manual metadata inputs.
+                    cls.WriteIndexDict(invocation_dir, {'library': {'properties': cls.LibraryProperties(cls.ReadRules(root))}, 'albums': albums})
+                    cls.ExportLegacy(invocation_dir)
+                    print('Collected %d albums, %d tracks into %s' % (len(albums), counters['tracks'], os.path.join(invocation_dir, 'index.dict')))
+                    print('Generated ' + os.path.join(invocation_dir, 'index.md'))
                     print('Counters: ' + json.dumps(counters, sort_keys=True)); return 0
-                prepared = os.path.abspath(os.path.expanduser(args.dir))
-                if not os.path.isfile(os.path.join(prepared, 'index.dict')): raise cls.Error('No index.dict. Run collect first: %s' % prepared)
-                albums, tracks = cls.ExportLegacy(prepared)
-                print('Indexed %d albums, %d tracks into %s' % (albums, tracks, os.path.join(prepared, 'index.md'))); return 0
+                if not os.path.isfile(os.path.join(root, 'index.dict')): raise cls.Error('No index.dict. Run collect first: %s' % root)
+                albums, tracks = cls.ExportLegacy(root, out=invocation_dir)
+                print('Indexed %d albums, %d tracks into %s' % (albums, tracks, os.path.join(invocation_dir, 'index.md'))); return 0
             except (cls.Error, OSError, ValueError, KeyError, ImportError) as e:
                 print('Indexer failed: %s' % e, file=sys.stderr); return 1
 
