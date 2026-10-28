@@ -6,6 +6,8 @@ From v3.0 _(previously labeled as v2.1)_, app has an "Ask" feature where user ca
 
 This feature is inspired by Spotify's feature
 
+Why? This feature for myself _(author)_, seems as an really a good addition to search from a big library & know about intersting facts about stats wrapped in a text
+
 > ### Difference between both "Ask" options:
 > - **Algorithmic**: algorithm on-device that could pre-embedded questions with user's context data
 > - **AI**: cloud/on-device AI model that answers library related questions, or what algorithmic couldn't process
