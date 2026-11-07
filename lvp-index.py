@@ -1,9 +1,10 @@
 # # temporary index solution, this has been corrected by GLM-5.3 (that's why most code could just not match what i do, so await for final version)
 from __future__ import annotations
-import os, re, sys, json, time, struct, shutil, secrets, argparse, tempfile, hashlib, base64, ast
+import os, re, sys, json, time, struct, shutil, secrets, argparse, tempfile, hashlib, base64, ast, gc as python_gc
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
 
-mutagen = FLAC = MP3 = MP4 = MP4FreeForm = MP4Cover = MP4Atoms = MP4AtomError = ID3 = TXXX = APEv2 = APENoHeaderError = None
+mutagen = FLAC = OggOpus = MP3 = MP4 = MP4FreeForm = MP4Cover = MP4Atoms = MP4AtomError = ID3 = TXXX = APEv2 = APENoHeaderError = None
 
 class Main:
     ManifestName = 'Tracks.dict'
@@ -18,12 +19,12 @@ class Main:
         BuildShow = f'{ManageVersion}{__build_type_show__}-{SubVersion}{SubComment}'
 
     class GlobalCache:
-        AudioExts = ('.flac.bin', '.flac', '.mp3', '.m4a')
-        UnsupportedExts = ('.mp4', '.opus', '.ogg', '.oga', '.wav', '.aiff', '.aif', '.aac', '.wma', '.ape')
+        AudioExts = ('.flac.bin', '.flac', '.mp3', '.m4a', '.opus')
+        UnsupportedExts = ('.mp4', '.ogg', '.oga', '.wav', '.aiff', '.aif', '.aac', '.wma', '.ape')
         ImageExts = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
         CoverStems = ('cover', 'folder', 'front', 'artwork', 'album', 'albumart', 'thumb', 'thumbnail')
         BackStems = ('back', 'backcover', 'back cover', 'back-cover', 'back_cover', 'rear', 'reverse', 'behind', 'bside', 'b-side')
-        SkipDirs = {'.git', '.tmp', 'node_modules'}
+        SkipDirs = {'.git', '.tmp', 'node_modules', '.lvp-metadata-cache'}
         ThumbMax = 600
         Workers = min(32, (os.cpu_count() or 4) * 2)
         TagCharsRe = re.compile(r'[^A-Z0-9_]+')
@@ -43,15 +44,22 @@ class Main:
         DigestRe = re.compile(r'[0-9a-f]{64}\Z')
         TrackRe = re.compile(r'[0-9a-f]{128}\Z')
         Ffmpeg = shutil.which('ffmpeg')
+        MaxOpusHeadBytes = 64 * 1024
+        MaxOpusTagsBytes = 16 * 1024 * 1024
+        MaxOpusPages = 10_000_000
+        MaxOpusPackets = 10_000_000
+        MaxOpusRanges = 100_000_000
+        MaxArtworkBytes = 32 * 1024 * 1024
 
     class Activities:
         @classmethod
         def EnsureMutagen(cls):
-            global mutagen, FLAC, MP3, MP4, MP4FreeForm, MP4Cover, MP4Atoms, MP4AtomError, ID3, TXXX, APEv2, APENoHeaderError
+            global mutagen, FLAC, OggOpus, MP3, MP4, MP4FreeForm, MP4Cover, MP4Atoms, MP4AtomError, ID3, TXXX, APEv2, APENoHeaderError
             if FLAC is not None: return
             try:
                 import mutagen
                 from mutagen.flac import FLAC
+                from mutagen.oggopus import OggOpus
                 from mutagen.mp3 import MP3
                 from mutagen.mp4 import MP4, MP4FreeForm, MP4Cover
                 from mutagen.mp4._atom import Atoms as MP4Atoms, AtomError as MP4AtomError
@@ -142,11 +150,19 @@ class Main:
 
         class Progress:
             def __init__(self, total, label): self.total = total; self.done = 0; self.label = label; self.start = time.monotonic()
-            def step(self):
+            def start_detail(self, detail):
+                if sys.stderr.isatty():
+                    sys.stderr.write('\r%s %d/%d ... %s' % (self.label, self.done, self.total, detail)); sys.stderr.flush()
+                else:
+                    print('%s %d/%d ... %s' % (self.label, self.done, self.total, detail), file=sys.stderr, flush=True)
+            def step(self, detail=None):
                 self.done += 1
                 if sys.stderr.isatty():
                     elapsed = max(time.monotonic() - self.start, .001); rate = self.done / elapsed
-                    sys.stderr.write('\r%s %d/%d (%.1f/s)' % (self.label, self.done, self.total, rate)); sys.stderr.flush()
+                    suffix = ' %s' % detail if detail else ''
+                    sys.stderr.write('\r%s %d/%d (%.1f/s)%s' % (self.label, self.done, self.total, rate, suffix)); sys.stderr.flush()
+                elif detail:
+                    print('%s %d/%d %s' % (self.label, self.done, self.total, detail), file=sys.stderr, flush=True)
             def close(self):
                 if sys.stderr.isatty(): sys.stderr.write('\r\033[K'); sys.stderr.flush()
 
@@ -154,6 +170,8 @@ class Main:
             def __init__(self): self.front = None; self.back = None; self.typed = False
             def add(self, ptype, mime, data):
                 if not data: return
+                if len(data) > gc.MaxArtworkBytes:
+                    raise Main.Activities.Error('Embedded artwork exceeds 32 MiB limit')
                 if ptype == 4:
                     if self.back is None: self.back = (mime, data)
                 elif ptype in (0, 3) and (self.front is None or (ptype == 3 and not self.typed)):
@@ -194,14 +212,22 @@ class Main:
         @classmethod
         def WalkAudio(cls, root):
             def failed(error): raise cls.Error('Source discovery failed: %s' % error)
-            for folder, dirs, files in os.walk(root, followlinks=False, onerror=failed):
-                dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d.lower() not in gc.SkipDirs and not os.path.islink(os.path.join(folder, d)))
+            seen_dirs = set(); seen_files = set()
+            for folder, dirs, files in os.walk(root, followlinks=True, onerror=failed):
+                stat = os.stat(folder); identity = (stat.st_dev, stat.st_ino)
+                if identity in seen_dirs:
+                    dirs[:] = []; continue
+                seen_dirs.add(identity)
+                dirs[:] = sorted(d for d in dirs if d.lower() not in gc.SkipDirs)
                 for name in sorted(files):
-                    if name.startswith('.'): continue
+                    if name.startswith('._') or any(marker in name for marker in ('.lvp-trackid-', '.lvp-backup-', '.lvp-rename-', '.lvp-write-')): continue
                     path = os.path.join(folder, name)
-                    if name.lower().endswith(gc.UnsupportedExts): raise cls.Error('%s: unsupported audio format; supported: FLAC, .flac.bin, MP3, M4A' % path)
+                    if name.lower().endswith(gc.UnsupportedExts): raise cls.Error('%s: unsupported audio format; supported: FLAC, .flac.bin, MP3, M4A, Opus' % path)
                     if name.lower().endswith(gc.AudioExts):
-                        if os.path.islink(path): raise cls.Error('%s: audio symlinks are not prepared; copy the source into the library' % path)
+                        if not os.path.isfile(path): raise cls.Error('%s: audio target is missing or not a regular file' % path)
+                        stat = os.stat(path); identity = (stat.st_dev, stat.st_ino)
+                        if identity in seen_files: continue
+                        seen_files.add(identity)
                         yield path
 
         @classmethod
@@ -272,12 +298,44 @@ class Main:
             return ids[0] if ids else None
 
         @classmethod
+        def CopyStreaming(cls, src, dst, path, ranges):
+            # Copy the stream while hashing only the payload ranges, so the copy and the
+            # before-verification digest cost one read instead of three.
+            h = hashlib.sha256(); covered = 0; index = 0; offset = 0
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk: break
+                limit = offset + len(chunk)
+                while index < len(ranges) and ranges[index][1] <= offset: index += 1
+                cursor = index
+                while cursor < len(ranges) and ranges[cursor][0] < limit:
+                    start, end = ranges[cursor]; begin = max(start, offset); stop = min(end, limit)
+                    if begin < stop: h.update(chunk[begin - offset:stop - offset]); covered += stop - begin
+                    cursor += 1
+                dst.write(chunk); offset = limit
+            if covered != sum(end - start for start, end in ranges):
+                raise cls.Error('%s: truncated audio payload' % path)
+            return h.hexdigest()
+
+        @classmethod
         def EmbedTrackID(cls, path, trackid):
             cls.EnsureMutagen()
             if not re.fullmatch(r'[0-9a-f]{128}', trackid): raise cls.Error('%s: invalid generated TrackID' % path)
-            ext = cls.SplitAudioExt(path)[1].lower(); fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.lvp-trackid-', suffix=ext, dir=os.path.dirname(path)); os.close(fd)
+            path = os.path.realpath(path)
+            before = cls.ReadSource(path)
+            if before['embedded_id'] == trackid: return None
+            if before['embedded_id'] is not None: raise cls.Error('%s: embedded TrackID conflicts with assigned identity' % path)
+            ext = cls.SplitAudioExt(path)[1].lower(); layout = before['layout']
+            # Ranges ordered on disk are hashed during the copy; other layouts hash both files after.
+            ranges = layout.get('payload_ranges') or [(layout['start'], layout['end'])]
+            inline = all(a[1] <= b[0] for a, b in zip(ranges, ranges[1:]))
+            fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.lvp-trackid-', suffix=ext, dir=os.path.dirname(path)); os.close(fd)
             try:
-                shutil.copy2(path, tmp)
+                stat = os.stat(path)
+                with open(path, 'rb') as src, open(tmp, 'wb') as out:
+                    if inline: digest = cls.CopyStreaming(src, out, path, ranges)
+                    else: digest = None; shutil.copyfileobj(src, out, 1024 * 1024)
+                    out.flush(); os.fsync(out.fileno())
                 if ext == '.mp3':
                     audio = MP3(tmp); audio.tags = audio.tags or ID3(); audio.tags.delall('TXXX:LVP_YZYWORKS_TRACKID'); audio.tags.add(TXXX(encoding=3, desc='LVP_YZYWORKS_TRACKID', text=trackid)); audio.save(v2_version=4)
                 elif ext == '.m4a':
@@ -286,48 +344,73 @@ class Main:
                     audio.tags['----:com.apple.iTunes:LVP_YZYWORKS_TRACKID'] = [MP4FreeForm(trackid.encode('utf-8'))]
                     audio.save()
                 else:
-                    audio = FLAC(tmp); audio['LVP_YZYWORKS_TRACKID'] = [trackid]; audio.save()
+                    audio = OggOpus(tmp) if ext == '.opus' else FLAC(tmp)
+                    audio['LVP_YZYWORKS_TRACKID'] = [trackid]; audio.save()
                 scan = cls.ReadSource(tmp); layout = scan['layout']
                 if scan['embedded_id'] != trackid: raise cls.Error('%s: embedded TrackID verification failed' % path)
-                before = cls.ReadSource(path); before_layout = before['layout']
-                if cls.HashPayload(path, before_layout) != cls.HashPayload(tmp, layout) or before.get('payload_signature') != scan.get('payload_signature'):
-                    raise cls.Error('%s: embedding changed audio payload' % path)
-                with open(tmp, 'rb') as f: f.read(1)
+                same = before.get('payload_signature') == scan.get('payload_signature')
+                if same:
+                    same = cls.HashPayload(tmp, layout) == digest if digest is not None else cls.HashPayload(path, before['layout']) == cls.HashPayload(tmp, layout)
+                if not same: raise cls.Error('%s: embedding changed audio payload' % path)
+                os.chmod(tmp, stat.st_mode & 0o7777); os.utime(tmp, ns=(stat.st_atime_ns, stat.st_mtime_ns))
                 return tmp
-            except Exception:
+            except BaseException:
                 if os.path.exists(tmp): os.unlink(tmp)
                 raise
 
         @classmethod
-        def EmbedTrackIDs(cls, root, state, keep_backups=None):
-            staged = []; backups = []
-            try:
-                for path, record in sorted(state['sources'].items()):
-                    if not record.get('active', True): continue
-                    trackid = record['id']; scan = cls.ReadSource(path)
-                    if scan['embedded_id'] == trackid: continue
-                    if scan['embedded_id'] is not None: raise cls.Error('%s: embedded TrackID conflicts with assigned identity' % path)
-                    staged.append((path, cls.EmbedTrackID(path, trackid)))
-                for path, tmp in staged:
-                    backup = path + '.lvp-backup-' + secrets.token_hex(8); shutil.copy2(path, backup); backups.append((path, backup)); os.replace(tmp, path)
-                if keep_backups is not None: keep_backups.extend(backups)
-                return len(staged)
-            except Exception:
-                for path, backup in reversed(backups):
-                    try: os.replace(backup, path)
-                    except OSError: pass
+        def CommitEmbed(cls, path, tmp, keep_backups=None):
+            if keep_backups is None:
+                os.replace(tmp, path); return
+            backup = path + '.lvp-backup-' + secrets.token_hex(8); shutil.copy2(path, backup)
+            try: os.replace(tmp, path)
+            except BaseException:
+                if os.path.exists(backup): os.unlink(backup)
                 raise
+            keep_backups.append((path, backup))
+
+        @classmethod
+        def EmbedTrackIDs(cls, root, state, keep_backups=None):
+            # Each file is verified before its atomic replace and embedding is idempotent,
+            # so files commit as they finish; a re-run skips what is already embedded.
+            # Staging the whole library (a full extra copy per track, plus a rollback copy)
+            # exhausted the disk and is what made this pass fail halfway.
+            active = [item for item in sorted(state['sources'].items()) if item[1].get('active', True)]
+            bar = cls.Progress(len(active), 'embedding TrackIDs')
+            if not active: bar.close(); return 0
+            workers = max(1, min(8, gc.Workers or 1)); live = set(); errors = []; committed = 0
+            def embed(item):
+                path, record = item; tmp = cls.EmbedTrackID(path, record['id'])
+                if tmp is not None: live.add(tmp)
+                return path if tmp is None else os.path.realpath(path), tmp
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {pool.submit(embed, item): item for item in active}
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        try: path, tmp = future.result()
+                        except CancelledError: continue
+                        except Exception as error:
+                            errors.append((item[0], error))
+                            for other in futures: other.cancel()
+                            bar.step(os.path.basename(item[0])); continue
+                        if tmp is not None:
+                            try: cls.CommitEmbed(path, tmp, keep_backups); live.discard(tmp); committed += 1
+                            except Exception as error:
+                                errors.append((item[0], error))
+                                for other in futures: other.cancel()
+                        bar.step(os.path.basename(item[0]))
             finally:
-                for _, tmp in staged:
+                bar.close()
+                for tmp in live:
                     if os.path.exists(tmp): os.unlink(tmp)
-                if keep_backups is None:
-                    for _, backup in backups:
-                        if os.path.exists(backup): os.unlink(backup)
+            if errors: raise min(errors, key=lambda item: item[0])[1]
+            return committed
 
         @classmethod
         def RenameSources(cls, root, state, keep_moves=None):
             records = [(path, record['id']) for path, record in state['sources'].items() if record.get('active', True)]
-            moves = []; sources = {}; targets = {}
+            moves = []; copies = []; sources = {}; targets = {}
             for path, trackid in records:
                 ext = cls.SplitAudioExt(path)[1]; target = os.path.join(os.path.dirname(path), trackid + ext)
                 stem, _ = cls.SplitAudioExt(path); targetstem, _ = cls.SplitAudioExt(target)
@@ -339,23 +422,33 @@ class Main:
                     if os.path.isfile(side) and (side, side_target) not in sidecars: sidecars.append((side, side_target))
                 for source, destination in [(path, target)] + sidecars:
                     source = os.path.abspath(source); destination = os.path.abspath(destination)
-                    if source in sources and sources[source] != destination: raise cls.Error('Rename source is used by multiple files: %s' % source)
+                    if source in sources:
+                        # Duplicate-format tracks share one sidecar file; the first rename claims
+                        # it and every other track gets a copy, so no lyrics reference dangles.
+                        if sources[source] != destination: copies.append((source, destination))
+                        continue
                     if destination in targets and targets[destination] != source: raise cls.Error('Rename targets collide: %s' % destination)
                     sources[source] = destination; targets[destination] = source
                     moves.append((source, destination))
             source_paths = set(sources)
             for source, destination in moves:
                 if os.path.lexists(destination) and destination not in source_paths: raise cls.Error('Rename target already exists: %s' % destination)
-            temps = []; committed = []
+            temps = []; committed = []; copied = []
             try:
                 for source, destination in moves:
                     temp = source + '.lvp-rename-' + secrets.token_hex(8); os.replace(source, temp); temps.append((temp, source, destination))
                 for temp, source, destination in temps:
                     os.makedirs(os.path.dirname(destination), exist_ok=True); os.replace(temp, destination); committed.append((temp, source, destination))
+                for origin, destination in copies:
+                    shutil.copy2(sources[origin], destination); copied.append(destination)
                 if keep_moves is not None:
                     keep_moves.extend((source, destination) for _, source, destination in committed)
                 return len(records)
             except Exception:
+                for destination in reversed(copied):
+                    if os.path.lexists(destination):
+                        try: os.unlink(destination)
+                        except OSError: pass
                 for temp, source, destination in reversed(committed):
                     if os.path.lexists(destination):
                         try: os.replace(destination, temp)
@@ -381,6 +474,51 @@ class Main:
             path = os.path.join(root, 'index.dict'); data = repr(catalog).encode('utf-8') + b'\n'; return cls.AtomicWrite(path, data)
 
         @classmethod
+        def SourceStamp(cls, path):
+            stat = os.stat(path)
+            return [os.path.realpath(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
+
+        @classmethod
+        def ReadMetadataCache(cls, directory, root):
+            try:
+                with open(os.path.join(directory, 'metadata.json'), encoding='utf-8') as f: cache = json.load(f)
+                if cache.get('version') == 1 and cache.get('root') == root and isinstance(cache.get('sources'), dict):
+                    return cache['sources']
+            except (OSError, ValueError, AttributeError): pass
+            return {}
+
+        @classmethod
+        def CachedSource(cls, directory, record, stamp):
+            if not isinstance(record, dict) or record.get('stamp') != stamp: return None
+            try:
+                scan = record['scan']
+                if not isinstance(scan['metadata'], dict) or not isinstance(scan['tech'], dict): return None
+                if not gc.TrackRe.fullmatch(scan['embedded_id']): return None
+                scan = dict(scan)
+                for kind in ('front', 'back'):
+                    art = record.get(kind)
+                    scan[kind] = None
+                    if art:
+                        mime, digest = art
+                        if not gc.DigestRe.fullmatch(digest): return None
+                        with open(os.path.join(directory, digest), 'rb') as f: data = f.read()
+                        if hashlib.sha256(data).hexdigest() != digest: return None
+                        scan[kind] = (mime, data)
+                return scan
+            except (OSError, KeyError, TypeError, ValueError): return None
+
+        @classmethod
+        def CacheArtwork(cls, directory, artwork):
+            if not artwork: return None
+            mime, data = artwork; digest = hashlib.sha256(data).hexdigest()
+            path = os.path.join(directory, digest)
+            try:
+                with open(path, 'rb') as f: valid = hashlib.sha256(f.read()).hexdigest() == digest
+            except OSError: valid = False
+            if not valid: cls.AtomicWrite(path, data)
+            return [mime, digest]
+
+        @classmethod
         def Collect(cls, root, rename=True, out=None):
             root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
             out = os.path.realpath(os.path.abspath(out)) if out is not None else root
@@ -393,10 +531,39 @@ class Main:
                 prop = os.path.join(folder, 'AlbumProperties')
                 props = cls.ParseProperties(prop)['values'] if os.path.isfile(prop) else {}
                 cls.LyricsOverride(props, prop); properties[folder] = props
-            scans = {}; bar = cls.Progress(len(paths), 'reading metadata')
+            cache_dir = os.path.join(out, '.lvp-metadata-cache')
+            cached = cls.ReadMetadataCache(cache_dir, root); records = {}; cache_hits = 0
+            os.makedirs(cache_dir, exist_ok=True)
+            scans = {}; embedded_artwork = {}; skipped = []; bar = cls.Progress(len(paths), 'reading metadata')
             try:
                 for path in paths:
-                    scan = cls.ReadSource(path); scan['generated'] = scan['embedded_id'] is None; scans[path] = scan; bar.step()
+                    bar.start_detail(os.path.basename(path))
+                    stamp = cls.SourceStamp(path)
+                    try:
+                        scan = cls.CachedSource(cache_dir, cached.get(path), stamp)
+                        if scan is None:
+                            scan = cls.ReadSource(path)
+                            if cls.SourceStamp(path) != stamp: raise cls.Error('Source changed while reading metadata: %s' % path)
+                        else: cache_hits += 1
+                    except cls.Error as error:
+                        if 'MP4 has no media data' not in str(error): raise
+                        skipped.append(path)
+                        if not sys.stderr.isatty(): print('Skipping media-less MP4: %s' % path, file=sys.stderr)
+                        bar.step(os.path.basename(path)); continue
+                    scan['generated'] = scan['embedded_id'] is None
+                    folder = cls.AlbumRoot(path, root)
+                    artwork = embedded_artwork.setdefault(folder, [None, None])
+                    artwork[0] = artwork[0] or scan.get('front')
+                    artwork[1] = artwork[1] or scan.get('back')
+                    records[path] = {'stamp': stamp, 'front': cls.CacheArtwork(cache_dir, scan.get('front')),
+                                     'back': cls.CacheArtwork(cache_dir, scan.get('back'))}
+                    # Layouts, raw tags, lyrics, and per-track artwork are only needed
+                    # while reading one file. Keeping them for the entire library OOMs.
+                    for key in ('raw', 'synced', 'plain', 'layout', 'payload_signature', 'front', 'back'):
+                        scan.pop(key, None)
+                    scans[path] = scan
+                    if len(scans) % 32 == 0: python_gc.collect()
+                    bar.step(os.path.basename(path))
             finally: bar.close()
             used = {}
             for path, scan in scans.items():
@@ -422,7 +589,8 @@ class Main:
                     scan = final[path]; meta = scan['metadata']; metas.append(meta); tid = scan['embedded_id']
                     deps = cls.Dependencies(path, folder)
                     front = front or deps['front']; back = back or deps['back']
-                    embedded_front = embedded_front or scan['front']; embedded_back = embedded_back or scan['back']
+                    embedded_front = embedded_front or embedded_artwork[folder][0]
+                    embedded_back = embedded_back or embedded_artwork[folder][1]
                     lyrics = {'timed': None, 'plain': None}
                     for dep in deps['lyrics']:
                         try:
@@ -442,7 +610,7 @@ class Main:
                 tagged_path = next((path for path in groups[folder] if final[path]['metadata'].get('album')), groups[folder][0])
                 pool = metas if os.path.isfile(prop) else artist_pools[cls.ArtistPoolKey(tagged_path, root, pick('album'))]
                 album = {'name': pick('album') or os.path.basename(folder), 'artist': cls.AlbumArtist(pool),
-                         'release_date': pick('release_date'), 'label': pick('label'), 'copyright': pick('copyright'),
+                         'release_date': cls.AlbumDate(metas), 'label': pick('label'), 'copyright': pick('copyright'),
                          'genre': cls.AlbumGenre(metas), 'description': props.get('description') or None,
                          'duration_seconds': sum(t['duration_seconds'] for t in tracks),
                          'folder': os.path.relpath(folder, out).replace(os.sep, '/'),
@@ -454,7 +622,42 @@ class Main:
                 if props.get('author', '').strip(): album['artist'] = props['author']
                 if props.get('year', '').strip() and not props.get('release_date', '').strip(): album['release_date'] = props['year'].strip()
                 albums.append(album)
-            return albums, {'albums': len(albums), 'tracks': len(final), 'embedded_trackids': sum(1 for s in scans.values() if s['generated']), 'renamed_tracks': renamed if rename else 0}
+            sources = {}
+            for path, scan in scans.items():
+                ext = cls.SplitAudioExt(path)[1]
+                destination = os.path.join(os.path.dirname(path), scan['embedded_id'] + ext) if rename else path
+                record = records[path]
+                # Embedding and renaming change stat identity; cache the committed file.
+                record['stamp'] = cls.SourceStamp(destination)
+                record['scan'] = {key: scan[key] for key in ('metadata', 'tech', 'embedded_id')}
+                sources[destination] = record
+            cls.AtomicWrite(os.path.join(cache_dir, 'metadata.json'), cls.Canonical({'version': 1, 'root': root, 'sources': sources}))
+            return albums, {'albums': len(albums), 'tracks': len(final), 'embedded_trackids': sum(1 for s in scans.values() if s['generated']), 'renamed_tracks': renamed if rename else 0, 'skipped_media_less': len(skipped), 'metadata_cache_hits': cache_hits, 'metadata_reads': len(paths) - cache_hits}
+
+        @classmethod
+        def AlbumDate(cls, metas):
+            dates = []
+            for meta in metas:
+                value = str(meta.get('release_date') or '').strip()
+                match = re.fullmatch(r'(\d{4})(?:[-/](\d{2})(?:[-/](\d{2}))?)?(?:[ T].*)?', value)
+                if not match: continue
+                year, month, day = match.groups()
+                try:
+                    from datetime import date
+                    date(int(year), int(month or 1), int(day or 1))
+                except ValueError: continue
+                dates.append(tuple(part for part in (year, month, day) if part is not None))
+            # Vote at each precision within the winning prefix; partial dates abstain
+            # from month/day votes. Ties prefer the earliest value.
+            winner = ()
+            for depth in range(3):
+                counts = {}
+                for parts in dates:
+                    if len(parts) > depth and parts[:depth] == winner:
+                        counts[parts[depth]] = counts.get(parts[depth], 0) + 1
+                if not counts: break
+                winner += (min(counts, key=lambda part: (-counts[part], part)),)
+            return '-'.join(winner) or None
 
         @classmethod
         def GenreOf(cls, raw):
@@ -575,10 +778,23 @@ class Main:
                 length = int.from_bytes(stsd_data[pos:pos + 4], 'big')
                 if length < 8 or pos + length > len(stsd_data): raise cls.Error('%s: malformed MP4 sample entry' % path)
                 entries.append(stsd_data[pos:pos + length]); pos += length
-            if len(entries) != 1 or entries[0][4:8] not in (b'mp4a', b'alac'):
-                codec = entries[0][4:8].decode('latin1', 'replace') if entries else 'unknown'
-                raise cls.Error('%s: unsupported MP4 audio codec: %s' % (path, codec))
+            if not entries or any(entry[4:8] not in (b'mp4a', b'alac') for entry in entries):
+                codecs = ', '.join(entry[4:8].decode('latin1', 'replace') for entry in entries) or 'unknown'
+                raise cls.Error('%s: unsupported MP4 audio codec: %s' % (path, codecs))
             codec = 'alac' if entries[0][4:8] == b'alac' else 'aac'
+            if any((entry[4:8] == b'alac') != (codec == 'alac') for entry in entries):
+                raise cls.Error('%s: MP4 mixes incompatible audio codecs' % path)
+            # Fragmented MP4 stores sample tables in moof/traf fragments rather than stbl.
+            stsc_data = cls.MP4Data(path, stsc)
+            if len(stsc_data) == 8 and int.from_bytes(stsc_data[4:8], 'big') == 0:
+                if not any(atom.name == b'moof' for atom in top):
+                    raise cls.Error('%s: unsupported empty MP4 sample table' % path)
+                ranges = [(atom._dataoffset, atom.offset + atom.length) for atom in mdats if atom.length > 8]
+                if not ranges: raise cls.Error('%s: MP4 has no usable fragmented media data' % path)
+                signature = cls.Digest({'codec': codec, 'stsd': stsd_data.hex(),
+                                        'ranges': [(start - ranges[0][0], end - start) for start, end in ranges]})
+                return {'start': ranges[0][0], 'end': ranges[-1][1], 'payload_ranges': ranges,
+                        'payload_signature': signature, 'blocks': [], 'codec': codec}
             def full(atom, label):
                 data = cls.MP4Data(path, atom)
                 if len(data) < 8: raise cls.Error('%s: malformed MP4 %s table' % (path, label))
@@ -586,7 +802,7 @@ class Main:
             stsc_data = full(stsc, 'stsc'); count = int.from_bytes(stsc_data[4:8], 'big')
             if len(stsc_data) != 8 + count * 12: raise cls.Error('%s: malformed MP4 stsc table' % path)
             changes = [tuple(int.from_bytes(stsc_data[8 + i * 12 + j * 4:12 + i * 12 + j * 4], 'big') for j in range(3)) for i in range(count)]
-            if not changes or any(first < 1 or samples < 1 or desc != 1 for first, samples, desc in changes): raise cls.Error('%s: unsupported MP4 sample-to-chunk table' % path)
+            if not changes or any(first < 1 or samples < 1 or not 1 <= desc <= len(entries) for first, samples, desc in changes): raise cls.Error('%s: unsupported MP4 sample-to-chunk table' % path)
             offset_atom = stco or co64; offset_data = full(offset_atom, 'chunk offset')
             offset_width = 4 if stco else 8; chunk_count = int.from_bytes(offset_data[4:8], 'big')
             if len(offset_data) != 8 + chunk_count * offset_width: raise cls.Error('%s: malformed MP4 chunk offset table' % path)
@@ -760,11 +976,69 @@ class Main:
             return {'start': start, 'end': end, 'blocks': []}
 
         @classmethod
+        def OpusLayout(cls, path):
+            # Ogg pages are rewritten when tags grow; verify audio packets, not page headers.
+            ranges = []; sizes = []; packet = bytearray(); packet_size = 0
+            packet_index = 0; page_count = 0; serial = sequence = None; head = None; ended = False; granule = 0
+            with open(path, 'rb') as f:
+                while True:
+                    page_count += 1
+                    if page_count > gc.MaxOpusPages:
+                        raise cls.Error('%s: Ogg stream exceeds page limit' % path)
+                    header = f.read(27)
+                    if not header: break
+                    if ended: raise cls.Error('%s: chained Ogg streams are unsupported; split to tracks first' % path)
+                    if len(header) != 27 or header[:5] != b'OggS\x00': raise cls.Error('%s: invalid Ogg page header' % path)
+                    flags = header[5]; page_serial, page_sequence = struct.unpack('<II', header[14:22])
+                    if serial is None:
+                        serial = page_serial; sequence = page_sequence
+                        if not flags & 2: raise cls.Error('%s: missing Ogg stream start' % path)
+                    elif page_serial != serial or page_sequence != sequence + 1 or flags & 2:
+                        raise cls.Error('%s: multiplexed or discontinuous Ogg stream' % path)
+                    sequence = page_sequence
+                    if bool(flags & 1) != bool(packet_size): raise cls.Error('%s: invalid Ogg packet continuation' % path)
+                    lacing = f.read(header[26])
+                    if len(lacing) != header[26]: raise cls.Error('%s: truncated Ogg segment table' % path)
+                    for length in lacing:
+                        start = f.tell(); data = f.read(length)
+                        if len(data) != length: raise cls.Error('%s: truncated Ogg packet' % path)
+                        next_size = packet_size + length
+                        if packet_index == 0 and next_size > gc.MaxOpusHeadBytes:
+                            raise cls.Error('%s: OpusHead packet exceeds size limit' % path)
+                        if packet_index == 1 and next_size > gc.MaxOpusTagsBytes:
+                            raise cls.Error('%s: OpusTags packet exceeds size limit' % path)
+                        if packet_index >= 2:
+                            if packet_index > gc.MaxOpusPackets:
+                                raise cls.Error('%s: Ogg stream exceeds packet limit' % path)
+                            if length:
+                                if len(ranges) >= gc.MaxOpusRanges:
+                                    raise cls.Error('%s: Ogg stream exceeds segment limit' % path)
+                                ranges.append((start, start + length))
+                        elif length: packet.extend(data)
+                        packet_size = next_size
+                        if length < 255:
+                            if packet_index == 0:
+                                head = bytes(packet)
+                                if not head.startswith(b'OpusHead') or len(head) < 19:
+                                    raise cls.Error('%s: invalid OpusHead packet' % path)
+                            elif packet_index == 1:
+                                if not packet.startswith(b'OpusTags'):
+                                    raise cls.Error('%s: missing OpusTags packet' % path)
+                            else: sizes.append(packet_size)
+                            packet_index += 1; packet.clear(); packet_size = 0
+                    granule = int.from_bytes(header[6:14], 'little'); ended = bool(flags & 4)
+            if not ended or packet_size or not sizes or not ranges: raise cls.Error('%s: incomplete Opus stream' % path)
+            signature = cls.Digest({'head': head.hex(), 'sizes': sizes, 'granule': granule})
+            return {'start': ranges[0][0], 'end': ranges[-1][1], 'payload_ranges': ranges,
+                    'payload_signature': signature, 'blocks': []}
+
+        @classmethod
         def ReadSource(cls, path):
             cls.EnsureMutagen()
-            ext = cls.SplitAudioExt(path)[1].lower(); layout = cls.Mp3Layout(path) if ext == '.mp3' else cls.MP4Layout(path) if ext == '.m4a' else cls.FlacLayout(path)
+            ext = cls.SplitAudioExt(path)[1].lower()
             try:
-                mf = MP3(path) if ext == '.mp3' else MP4(path) if ext == '.m4a' else FLAC(path)
+                layout = cls.Mp3Layout(path) if ext == '.mp3' else cls.MP4Layout(path) if ext == '.m4a' else cls.OpusLayout(path) if ext == '.opus' else cls.FlacLayout(path)
+                mf = MP3(path) if ext == '.mp3' else MP4(path) if ext == '.m4a' else OggOpus(path) if ext == '.opus' else FLAC(path)
                 raw = {}; art = cls.ArtPicker(); synced = []; plain = []
                 if ext == '.m4a':
                     raw = cls.MP4Raw(path, mf.tags, art, synced, plain)
@@ -787,7 +1061,7 @@ class Main:
                                 picture = mutagen.flac.Picture(base64.b64decode(value, validate=True)); art.add(picture.type, picture.mime, picture.data)
                         elif cls.Key(key) in ('coverart', 'coverartmime'): raise cls.Error('%s: unsupported legacy base64 coverart comment; use native FLAC PICTURE blocks' % path)
                         else: raw[key] = list(values)
-                    for picture in mf.pictures: art.add(picture.type, picture.mime, picture.data)
+                    for picture in getattr(mf, 'pictures', ()): art.add(picture.type, picture.mime, picture.data)
                 else:
                     for key, frame in (mf.tags or {}).items():
                         fid = frame.FrameID
@@ -815,17 +1089,18 @@ class Main:
                 for key in ('syncedlyrics', 'lyrics', 'unsyncedlyrics', 'unsyncedlyric'):
                     for text in cls.TagValues(raw, key):
                         (synced if cls.IsTimed(text) else plain).append(text)
-                if ext != '.mp3' and layout['blocks'][0][1] > 8:
+                if ext in ('.flac', '.flac.bin') and layout['blocks'][0][1] > 8:
                     prefix = ID3(path)
                     for frame in prefix.getall('TXXX'): raw.setdefault(frame.desc, []).extend(str(v) for v in frame.text)
                     if any(frame.FrameID != 'TXXX' for frame in prefix.values()):
                         raise cls.Error('%s: descriptive ID3 prefix on FLAC is unsupported; convert its tags to native FLAC tags on a copy' % path)
                 info = mf.info
-                tech = {'codec': 'mp3' if ext == '.mp3' else 'flac', 'duration_seconds': info.length,
-                        'sample_rate': info.sample_rate, 'channels': info.channels, 'bit_depth': getattr(info, 'bits_per_sample', None),
+                tech = {'codec': 'mp3' if ext == '.mp3' else 'opus' if ext == '.opus' else 'flac', 'duration_seconds': info.length,
+                        'sample_rate': 48000 if ext == '.opus' else info.sample_rate, 'channels': info.channels, 'bit_depth': getattr(info, 'bits_per_sample', None),
                         'bitrate': getattr(info, 'bitrate', None)}
                 return {'raw': raw, 'metadata': cls.Normalize(raw, os.path.basename(path)), 'tech': tech, 'embedded_id': cls.TrackID(raw, path),
-                        'front': art.front, 'back': art.back, 'synced': synced, 'plain': plain, 'layout': layout}
+                        'front': art.front, 'back': art.back, 'synced': synced, 'plain': plain, 'layout': layout,
+                        'payload_signature': layout.get('payload_signature')}
             except cls.Error: raise
             except Exception as e: raise cls.Error('%s: metadata extraction failed: %s' % (path, e)) from e
 
@@ -878,6 +1153,21 @@ class Main:
         def ExportLegacy(cls, root, out=None):
             root = os.path.realpath(os.path.abspath(root)); out = os.path.realpath(os.path.abspath(out)) if out is not None else root
             catalog = cls.ReadIndexDict(root)
+            rules = dict(catalog.get('library', {}).get('properties', {}))
+            for directory in dict.fromkeys((root, out)):
+                rules.update(cls.ReadRules(directory))
+                path = os.path.join(directory, 'IndexerRules')
+                if os.path.isfile(path): rules.update(cls.ParseProperties(path)['values'])
+            sort_by_date = str(rules.get('sort-pi-by-date', 'yes')).strip().lower()
+            if sort_by_date not in ('yes', 'no'): raise cls.Error('sort-pi-by-date must be yes or no')
+            albums = catalog.get('albums', [])
+            if sort_by_date == 'yes':
+                def date_key(album):
+                    match = re.match(r'^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?(?:$|[ T])', str(album.get('release_date') or '').strip())
+                    if not match: return (0, 0, 0)
+                    year, month, day = match.groups()
+                    return (int(year), int(month or 0), int(day or 0))
+                albums = sorted(albums, key=date_key, reverse=True)
             artwork_names = {}
             if root != out:
                 for album in catalog.get('albums', []):
@@ -890,7 +1180,7 @@ class Main:
                             if path: track['lyrics'][key] = os.path.relpath(os.path.join(root, path), out).replace(os.sep, '/')
             lines = ['# yzyworks.com']
             lines += ['%s: %s' % (k, str(v).replace('\n', ' ')) for k, v in catalog.get('library', {}).get('properties', {}).items()]
-            for album in catalog.get('albums', []):
+            for album in albums:
                 art = album.get('artwork') or {}; lines += ['', '---']
                 if art.get('front'): lines.append('> ![](%s)' % quote(art['front']))
                 lines.append('> ' + (album.get('name') or 'Unknown album').replace('\n', ' '))
@@ -913,6 +1203,99 @@ class Main:
             return len(catalog.get('albums', [])), sum(len(a.get('tracks', [])) for a in catalog.get('albums', []))
 
         @classmethod
+        def DedupeTitle(cls, track, album):
+            # Title identity for duplicate matching: whitespace and case folded, a
+            # trailing "(feat. ...)" credit and a trailing " - <artist>" tag dropped,
+            # then reduced to letters and digits. Version markers ("[v1]", "(live)",
+            # "(instrumental)", "(nightmare)", "pt 2", edits) are deliberately kept so
+            # version labels remain distinct candidate groups.
+            title = ' '.join((track.get('title') or '').split()).casefold()
+            title = re.sub(r'\s*[\(\[]\s*(?:feat\.?|featuring|ft\.?)\b[^)\]]*[\)\]]\s*$', '', title)
+            for artist in (track.get('artist'), album.get('artist')):
+                artist = ' '.join((artist or '').split()).casefold()
+                if artist and title.endswith(' - ' + artist):
+                    title = title[:-(len(' - ' + artist))]; break
+            return ''.join(c for c in title if c.isalnum())
+
+        @classmethod
+        def DedupeLibrary(cls, root, apply=False):
+            # Metadata narrows the search, but only identical encoded audio payloads
+            # qualify. Catalog filtering is reversible; source files are never removed.
+            root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
+            catalog = cls.ReadIndexDict(root)
+            albums = catalog.get('albums') or []
+            groups = {}
+            def path_for(relative):
+                if not relative or os.path.isabs(relative): raise cls.Error('Invalid catalog path: %r' % relative)
+                path = os.path.abspath(os.path.join(root, relative))
+                if os.path.commonpath((root, path)) != root: raise cls.Error('Catalog path escapes root: %s' % relative)
+                return path
+
+            for entry in albums:
+                for track in entry.get('tracks') or []:
+                    title = cls.DedupeTitle(track, entry)
+                    artist = ' '.join((entry.get('artist') or '').split()).casefold()
+                    key = (' '.join((entry.get('name') or '').split()).casefold(), artist, title)
+                    if title and key[0]: groups.setdefault(key, []).append((entry, track))
+
+            clusters = []
+            for members in groups.values():
+                if len(members) < 2: continue
+                verified = {}
+                for entry, track in members:
+                    path = path_for(track['path'])
+                    scan = cls.ReadSource(path)
+                    tech = scan['tech']
+                    key = (tech['codec'], tech.get('sample_rate'), tech.get('channels'),
+                           tech.get('bit_depth'), cls.HashPayload(path, scan['layout']))
+                    verified.setdefault(key, []).append((entry, track))
+                clusters.extend(items for items in verified.values() if len(items) > 1)
+
+            removed = set(); count = 0
+            for cluster in clusters:
+                # Prefer the fuller release, then a deterministic path. There is no
+                # quality ranking: every member has the same encoded audio payload.
+                keep = min(cluster, key=lambda item: (-len(item[0].get('tracks') or []), item[1]['path']))
+                for item in cluster:
+                    if item is keep: continue
+                    print('Verified duplicate: keep %s, hide %s' % (keep[1]['path'], item[1]['path']))
+                    removed.add(id(item[1])); count += 1
+                # Keep references to existing sidecars, including plain lyrics. Do not
+                # overwrite competing lyrics or assume a larger file is more accurate.
+                lyrics = keep[1].setdefault('lyrics', {})
+                for kind in ('timed', 'plain'):
+                    if lyrics.get(kind): continue
+                    for _, track in cluster:
+                        relative = (track.get('lyrics') or {}).get(kind)
+                        if relative and os.path.isfile(path_for(relative)):
+                            lyrics[kind] = relative; break
+
+            if apply and count:
+                backup = tempfile.mkdtemp(prefix='.lvp-dedupe-', dir=root)
+                for name in ('index.dict', 'index.md'):
+                    source = os.path.join(root, name)
+                    if os.path.lexists(source):
+                        if os.path.islink(source): raise cls.Error('Refusing catalog symlink: %s' % source)
+                        shutil.copy2(source, os.path.join(backup, name))
+                for entry in albums:
+                    entry['tracks'] = [t for t in (entry.get('tracks') or []) if id(t) not in removed]
+                    entry['duration_seconds'] = sum(t.get('duration_seconds') or 0 for t in entry['tracks'])
+                catalog['albums'] = [a for a in albums if a.get('tracks')]
+                try:
+                    cls.WriteIndexDict(root, catalog)
+                    cls.ExportLegacy(root)
+                except Exception:
+                    for name in ('index.dict', 'index.md'):
+                        saved = os.path.join(backup, name)
+                        if os.path.isfile(saved): cls.AtomicWrite(os.path.join(root, name), open(saved, 'rb').read())
+                    raise
+                print('Hidden %d verified duplicates from catalog. Sources unchanged. Snapshots: %s' % (count, backup))
+            elif count:
+                print('Found %d verified duplicate groups, %d redundant catalog tracks. --apply filters the catalog only; sources are retained.' % (len(clusters), count))
+            else: print('No verified duplicate tracks found.')
+            return {'groups': len(clusters), 'files': count}
+
+        @classmethod
         def Run(cls):
             invocation_dir = os.getcwd()
             ap = argparse.ArgumentParser(description='Collect library metadata, or push collected metadata into index.md.')
@@ -923,6 +1306,9 @@ class Main:
             collect.add_argument('--do-not-rename', action='store_true', help='keep source filenames instead of renaming audio (and .lrc/.txt sidecars) to their TrackIDs')
             push = sub.add_parser('push-index', help='index a collected directory into index.md')
             push.add_argument('dir', nargs='?', default='.', help='catalog directory containing index.dict (default: invocation working directory); index.md and copied covers always go in the invocation working directory')
+            dedupe = sub.add_parser('dedupe', help='report matching-title tracks with identical audio payloads')
+            dedupe.add_argument('dir', nargs='?', default='.', help='catalog directory containing index.dict (default: invocation working directory)')
+            dedupe.add_argument('--apply', action='store_true', help='back up snapshots and hide verified duplicates from index.dict and index.md, preserving all source files')
             args = ap.parse_args()
             try:
                 root = os.path.realpath(os.path.join(invocation_dir, os.path.expanduser(args.dir)))
@@ -935,6 +1321,8 @@ class Main:
                     print('Collected %d albums, %d tracks into %s' % (len(albums), counters['tracks'], os.path.join(invocation_dir, 'index.dict')))
                     print('Generated ' + os.path.join(invocation_dir, 'index.md'))
                     print('Counters: ' + json.dumps(counters, sort_keys=True)); return 0
+                if args.command == 'dedupe':
+                    cls.DedupeLibrary(root, args.apply); return 0
                 if not os.path.isfile(os.path.join(root, 'index.dict')): raise cls.Error('No index.dict. Run collect first: %s' % root)
                 albums, tracks = cls.ExportLegacy(root, out=invocation_dir)
                 print('Indexed %d albums, %d tracks into %s' % (albums, tracks, os.path.join(invocation_dir, 'index.md'))); return 0
