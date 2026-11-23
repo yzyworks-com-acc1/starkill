@@ -5,7 +5,7 @@
 ## November 2026: New artists (that will be added)
 
 ### Batch 1
-#### In progress; fully done by 23-25th of Novermber
+#### Pauses, reason: main content server `rapture` is having an critical issue with storage (only first 4 are done); fully done by 23-25th of Novermber
 
 1. Young Thug: https://music.apple.com/us/artist/young-thug/81886939
 2. Gunna: https://music.apple.com/us/artist/gunna/1236267297
