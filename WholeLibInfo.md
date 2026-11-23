@@ -11,13 +11,13 @@
 2. Gunna: https://music.apple.com/us/artist/gunna/1236267297
 3. JID: https://music.apple.com/us/artist/jid/282841404
 4. Baby Keem: https://music.apple.com/us/artist/baby-keem/1413572916
-5. Chief Keef: https://music.apple.com/us/search?term=Chief+Keef
-6. Kodak Black: https://music.apple.com/us/search?term=Kodak+Black
-7. Trippie Redd: https://music.apple.com/us/search?term=Trippie+Redd
-8. Frank Ocean: https://music.apple.com/us/search?term=Frank+Ocean
-9. Nett: https://music.apple.com/us/search?term=Nettspend
-10. xaviersobased: https://music.apple.com/us/search?term=xaviersobased
-11. Freddie Gibbs: https://music.apple.com/us/search?term=Freddie+Gibbs
+5. Chief Keef: https://music.apple.com/us/artist/chief-keef/516663045
+6. Kodak Black: https://music.apple.com/us/artist/kodak-black/953921140
+7. Trippie Redd: https://music.apple.com/us/artist/trippie-redd/1203172438
+8. Frank Ocean: https://music.apple.com/us/artist/frank-ocean/442122051
+9. Nett: https://music.apple.com/us/artist/nettspend/1662047435
+10. xaviersobased: https://music.apple.com/us/artist/xaviersobased/1540848340
+11. Freddie Gibbs: https://music.apple.com/us/artist/freddie-gibbs/302166615
 -----
 ### Batch 2
 #### Hasn't started yet; excepted 25-27 of November
