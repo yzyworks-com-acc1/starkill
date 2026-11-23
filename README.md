@@ -30,5 +30,5 @@
 # Other
 - [**App Documentaion on sertain things**](AppDocumentationQAtypa.md)
 - [**Self-Hosting Full Guide/Instructions**](SetupSelfHostedSolution.md)
-- [**Build-in libraries**](BuildIn_Libraries.md)
+- [**WholeLib Info Board**](WholeLibInfo.md)
 - [**LVP Tags Documentation** _(related to Self-Hosting solution, recommended to use with)_](LVP_TagsDocumentation.md)
