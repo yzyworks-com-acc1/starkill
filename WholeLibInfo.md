@@ -5,7 +5,7 @@
 ## November 2026: New artists (that will be added)
 
 ### Batch 1
-#### In progress; fully done by 23-25th of Novermber
+#### Completed
 
 1. Young Thug: https://music.apple.com/us/artist/young-thug/81886939
 2. Gunna: https://music.apple.com/us/artist/gunna/1236267297
@@ -20,7 +20,7 @@
 11. Freddie Gibbs: https://music.apple.com/us/artist/freddie-gibbs/302166615
 -----
 ### Batch 2
-#### Hasn't started yet; excepted 25-27 of November
+#### In progress; excepted 25-26 of November
 
 1. EARTHGANG: https://music.apple.com/us/artist/earthgang/1153122382
 2. Lil Yachty: https://music.apple.com/us/artist/lil-yachty/1080733657
