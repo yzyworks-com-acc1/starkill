@@ -531,12 +531,33 @@ class Main:
                 prop = os.path.join(folder, 'AlbumProperties')
                 props = cls.ParseProperties(prop)['values'] if os.path.isfile(prop) else {}
                 cls.LyricsOverride(props, prop); properties[folder] = props
+            trust = cls.ReadRules(root).get('collect_trust-trackid-from-filename', 'yes').strip().lower()
+            if trust not in ('yes', 'no'): raise cls.Error('collect_trust-trackid-from-filename must be yes or no')
+            known = {}; reused = {}
+            if trust == 'yes' and os.path.lexists(os.path.join(out, 'index.dict')):
+                previous = cls.ReadIndexDict(out)
+                for album in previous.get('albums', []):
+                    if not isinstance(album, dict) or not isinstance(album.get('tracks'), list): raise cls.Error('Invalid album in source catalog')
+                    for track in album['tracks']:
+                        if not isinstance(track, dict) or not isinstance(track.get('id'), str): raise cls.Error('Invalid track in source catalog')
+                        tid = track['id']
+                        if tid in known: raise cls.Error('Duplicate TrackID in source catalog: %s' % tid)
+                        known[tid] = (album, track)
+                for path in paths:
+                    tid = cls.SplitAudioExt(os.path.basename(path))[0]
+                    if gc.TrackRe.fullmatch(tid) and tid in known:
+                        album, track = known[tid]
+                        required = ('title', 'artist', 'album', 'track', 'disc', 'duration_seconds', 'categories', 'path', 'lyrics')
+                        if any(key not in track for key in required) or not isinstance(track['lyrics'], dict):
+                            raise cls.Error('Incomplete catalog track: %s' % tid)
+                        reused[path] = (album, dict(track))
+            pending = [path for path in paths if path not in reused]
             cache_dir = os.path.join(out, '.lvp-metadata-cache')
             cached = cls.ReadMetadataCache(cache_dir, root); records = {}; cache_hits = 0
             os.makedirs(cache_dir, exist_ok=True)
-            scans = {}; embedded_artwork = {}; skipped = []; bar = cls.Progress(len(paths), 'reading metadata')
+            scans = {}; embedded_artwork = {}; skipped = []; bar = cls.Progress(len(pending), 'collecting uncatalogued tracks')
             try:
-                for path in paths:
+                for path in pending:
                     bar.start_detail(os.path.basename(path))
                     stamp = cls.SourceStamp(path)
                     try:
@@ -566,6 +587,10 @@ class Main:
                     bar.step(os.path.basename(path))
             finally: bar.close()
             used = {}
+            for path, (_, track) in reused.items():
+                tid = track['id']
+                if tid in used: raise cls.Error('Duplicate TrackID %s in %s and %s; remove the duplicate input' % (tid, used[tid], path))
+                used[tid] = path
             for path, scan in scans.items():
                 if scan['generated']: scan['embedded_id'] = secrets.token_hex(64)
                 tid = scan['embedded_id']
@@ -581,11 +606,26 @@ class Main:
             for path in sorted(final):
                 meta = final[path]['metadata']; groups.setdefault(cls.AlbumRoot(path, root), []).append(path)
                 artist_pools.setdefault(cls.ArtistPoolKey(path, root, meta.get('album')), []).append(meta)
+            for path in sorted(reused):
+                groups.setdefault(cls.AlbumRoot(path, root), []).append(path)
             albums = []; artwork_names = {}
+            # Reserve retained cover names without loading or hashing their bytes.
+            for old, _ in reused.values():
+                for value in old.get('artwork', {}).values():
+                    if value:
+                        cover = os.path.abspath(os.path.join(out, value))
+                        artwork_names[os.path.splitext(os.path.basename(cover))[0].casefold()] = (None, cover)
             for folder in sorted(groups):
                 prop = os.path.join(folder, 'AlbumProperties'); props = properties[folder]
                 tracks = []; metas = []; front = back = embedded_front = embedded_back = None
+                retained = []
                 for path in sorted(groups[folder]):
+                    if path in reused:
+                        old, track = reused[path]
+                        retained.append(old)
+                        track['path'] = os.path.relpath(path, out).replace(os.sep, '/')
+                        tracks.append(track)
+                        continue
                     scan = final[path]; meta = scan['metadata']; metas.append(meta); tid = scan['embedded_id']
                     deps = cls.Dependencies(path, folder)
                     front = front or deps['front']; back = back or deps['back']
@@ -607,8 +647,9 @@ class Main:
                 front = cls.WriteArtwork(out, embedded_front, name, used=artwork_names) if embedded_front else cls.CopyArtwork(out, front, name, used=artwork_names) if front and out != root else front
                 back = cls.WriteArtwork(out, embedded_back, name, 'back', artwork_names) if embedded_back else cls.CopyArtwork(out, back, name, 'back', artwork_names) if back and out != root else back
                 tracks.sort(key=lambda t: (t['disc'] or 0, t['track'] or 0, t['id']))
-                tagged_path = next((path for path in groups[folder] if final[path]['metadata'].get('album')), groups[folder][0])
-                pool = metas if os.path.isfile(prop) else artist_pools[cls.ArtistPoolKey(tagged_path, root, pick('album'))]
+                fresh = [path for path in groups[folder] if path in final]
+                tagged_path = next((path for path in fresh if final[path]['metadata'].get('album')), fresh[0] if fresh else None)
+                pool = metas if os.path.isfile(prop) or tagged_path is None else artist_pools[cls.ArtistPoolKey(tagged_path, root, pick('album'))]
                 album = {'name': pick('album') or os.path.basename(folder), 'artist': cls.AlbumArtist(pool),
                          'release_date': cls.AlbumDate(metas), 'label': pick('label'), 'copyright': pick('copyright'),
                          'genre': cls.AlbumGenre(metas), 'description': props.get('description') or None,
@@ -617,12 +658,19 @@ class Main:
                          'artwork': {'front': os.path.relpath(front, out).replace(os.sep, '/') if front else None,
                                      'back': os.path.relpath(back, out).replace(os.sep, '/') if back else None},
                          'properties': props, 'tracks': tracks}
+                if retained:
+                    # Catalogs contain album aggregates, not per-track date/artist votes.
+                    # Keep that baseline for mixed groups; current properties still win.
+                    for key in ('name', 'artist', 'release_date', 'label', 'copyright', 'genre', 'description'):
+                        album[key] = next((old.get(key) for old in retained if old.get(key)), album[key])
+                    for role in ('front', 'back'):
+                        album['artwork'][role] = next((old.get('artwork', {}).get(role) for old in retained if old.get('artwork', {}).get(role)), album['artwork'][role])
                 for key in ('name', 'artist', 'release_date', 'label', 'copyright', 'genre', 'description'):
                     if props.get(key, '').strip(): album[key] = props[key]
                 if props.get('author', '').strip(): album['artist'] = props['author']
                 if props.get('year', '').strip() and not props.get('release_date', '').strip(): album['release_date'] = props['year'].strip()
                 albums.append(album)
-            sources = {}
+            sources = {path: cached[path] for path in reused if path in cached}
             for path, scan in scans.items():
                 ext = cls.SplitAudioExt(path)[1]
                 destination = os.path.join(os.path.dirname(path), scan['embedded_id'] + ext) if rename else path
@@ -632,7 +680,7 @@ class Main:
                 record['scan'] = {key: scan[key] for key in ('metadata', 'tech', 'embedded_id')}
                 sources[destination] = record
             cls.AtomicWrite(os.path.join(cache_dir, 'metadata.json'), cls.Canonical({'version': 1, 'root': root, 'sources': sources}))
-            return albums, {'albums': len(albums), 'tracks': len(final), 'embedded_trackids': sum(1 for s in scans.values() if s['generated']), 'renamed_tracks': renamed if rename else 0, 'skipped_media_less': len(skipped), 'metadata_cache_hits': cache_hits, 'metadata_reads': len(paths) - cache_hits}
+            return albums, {'albums': len(albums), 'tracks': len(final) + len(reused), 'embedded_trackids': sum(1 for s in scans.values() if s['generated']), 'renamed_tracks': renamed if rename else 0, 'skipped_media_less': len(skipped), 'catalog_reused': len(reused), 'metadata_cache_hits': cache_hits, 'metadata_reads': len(pending) - cache_hits}
 
         @classmethod
         def AlbumDate(cls, metas):
