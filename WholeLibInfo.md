@@ -24,16 +24,16 @@
 
 1. EARTHGANG: https://music.apple.com/us/artist/earthgang/1153122382
 2. Lil Yachty: https://music.apple.com/us/artist/lil-yachty/1080733657
-3. Homixide Gang: https://music.apple.com/us/search?term=Homixide+Gang
-4. Lil Baby: https://music.apple.com/us/search?term=Lil+Baby
-5. Ski Mask the Slump God: https://music.apple.com/us/search?term=Ski+Mask+the+Slump+God
-6. Denzel Curry: https://music.apple.com/us/search?term=Denzel+Curry
-7. Joey Bada$$: https://music.apple.com/us/search?term=Joey+Bada%24%24
-8. Earl Sweatshirt: https://music.apple.com/us/search?term=Earl+Sweatshirt
-9. Steve Lacy: https://music.apple.com/us/search?term=Steve+Lacy
-10. Childish Gambino: https://music.apple.com/us/search?term=Childish+Gambino
-11. N.E.R.D: https://music.apple.com/us/search?term=N.E.R.D
-12. Daniel Caesar: https://music.apple.com/us/search?term=Daniel+Caesar
+3. Homixide Gang: https://music.apple.com/us/artist/homixide-gang/1565025798
+4. Lil Baby: https://music.apple.com/us/artist/lil-baby/1276656483
+5. Ski Mask the Slump God: https://music.apple.com/us/artist/ski-mask-the-slump-god/1174308445
+6. Denzel Curry: https://music.apple.com/us/artist/denzel-curry/631440154
+7. Joey Bada$$: https://music.apple.com/us/artist/joey-bada%24%24/577261450
+8. Earl Sweatshirt: https://music.apple.com/us/artist/earl-sweatshirt/445693504
+9. Steve Lacy: https://music.apple.com/us/artist/steve-lacy/1210275020
+10. Childish Gambino: https://music.apple.com/us/artist/steve-lacy/1210275020
+11. N.E.R.D: https://music.apple.com/us/artist/n-e-r-d/626510
+12. Daniel Caesar: https://music.apple.com/us/artist/daniel-caesar/1019899019
 ----
 ### Batch 3
 #### Hasn't started yet; excepted 27-29 of November
